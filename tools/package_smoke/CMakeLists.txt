@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(js8core_package_smoke LANGUAGES CXX)
+find_package(js8core CONFIG REQUIRED)
+add_executable(js8core_package_smoke main.cpp)
+target_link_libraries(js8core_package_smoke PRIVATE js8core::js8core)

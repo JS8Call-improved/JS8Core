@@ -1,0 +1,55 @@
+name: JS8Core native regression tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: js8core-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install header-only dependencies
+        run: sudo apt-get update && sudo apt-get install -y libeigen3-dev libboost-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DBUILD_TESTING=ON
+      - name: Build
+        run: >
+          cmake --build build --parallel 2 --target
+          js8core js8core-crc-test js8core-varicode-test js8core-policy-test js8core-clock-math-test
+          verify_jsc_roundtrip js8core-vox-test js8core-fractional-rx-test
+          js8core-decoder-roundtrip-test js8core-engine-smoke-test js8core-wav-decode-test js8core-rig-test js8core-callback-reentrancy-test js8core-compat-header-test js8core-tx-threaded-lifecycle-test js8core-session-lifecycle-test js8core-host-callback-hardening-test js8core-rig-generation-test js8core-android-compat-test
+      - name: Run CTest
+        run: ctest --test-dir build --output-on-failure --timeout 180
+      - name: Download reference WAV fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p build/wav-fixtures
+          REFERENCE=f1021126bdf9c4979c7213515b91f421d820a261
+          for file in A_1_4.wav A_2_1.wav A_2_3.wav A_2_5.wav A_2_6.wav A_2_9.wav A_3_3.wav E_1_1.wav E_2_1.wav; do
+            curl -fL --retry 3 --silent --show-error \
+              "https://raw.githubusercontent.com/punk-kaos/JS8Call-improved/$REFERENCE/media/tests/$file" \
+              -o "build/wav-fixtures/$file"
+          done
+      - name: Verify reference WAV decoding
+        run: |
+          ./build/js8core-wav-decode-test A build/wav-fixtures/A_*.wav
+          ./build/js8core-wav-decode-test E build/wav-fixtures/E_*.wav
+      - name: Verify installed package
+        run: |
+          cmake --install build --prefix "$PWD/stage"
+          cmake -S tools/package_smoke -B build/downstream -DCMAKE_PREFIX_PATH="$PWD/stage"
+          cmake --build build/downstream --parallel 2
+          ./build/downstream/js8core_package_smoke

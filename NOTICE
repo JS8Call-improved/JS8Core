@@ -1,0 +1,37 @@
+JS8Core
+Copyright (c) 2026 Kelly-Shane Fuller and contributors
+
+JS8Core is an independent implementation of the JS8 protocol. It is
+distributed under the MIT license (see LICENSE).
+
+Portions of this distribution include on-air protocol constants, LDPC and
+varicode mappings, and the index-ordered JSC dictionary required for
+interoperability. The JSC search index and receive FIR are independently
+generated. See docs/protocol-data-provenance.md for the per-table inventory.
+
+The classification of protocol data does not itself determine copyright
+ownership or establish that a dictionary compilation lacks protected
+selection or arrangement. Review third-party rights before release.
+
+Third-party components:
+
+  PocketFFT
+  Copyright (c) 2018 Max-Planck-Society and contributors
+  License: BSD-3-Clause
+  Location: vendor/pocketfft/
+
+  Eigen
+  License: MPL-2.0
+  Used as a header-only dependency.
+
+  CRCpp-compatible shim
+  License: MIT
+  Location: vendor/CRCpp/CRC.h
+
+  Android log fallback shim
+  License: MIT
+  Location: vendor/android/log.h
+
+This notice does not certify the licensing of copied protocol compilations.
+The MIT license applies to project-authored implementation code; third-party
+materials retain any applicable rights and license obligations.

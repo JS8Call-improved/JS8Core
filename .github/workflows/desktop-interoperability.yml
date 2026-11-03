@@ -1,0 +1,96 @@
+name: JS8Core versus desktop decoder (full WAV records)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout independent JS8Core
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned desktop reference (test-only; not packaged)
+        uses: actions/checkout@v4
+        with:
+          repository: JS8Call-improved/JS8Call-improved
+          ref: 0130e04eca17859ccc176c6e7ce0f47dda0d25fb
+          path: desktop
+
+      - name: Install native decoder and reference dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeigen3-dev libboost-dev \
+            qt6-base-dev qt6-base-dev-tools libfftw3-dev pkg-config
+
+      - name: Build JS8Core decode recorder
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel 2 --target js8core-wav-decode-test
+
+      - name: Compile isolated desktop decoder reference runner
+        run: |
+          set -euo pipefail
+          mkdir -p build/desktop-reference
+          /usr/lib/qt6/libexec/moc desktop/JS8_Mode/JS8.cpp \
+            -o build/desktop-reference/JS8.moc
+          /usr/lib/qt6/libexec/moc desktop/JS8_Mode/JS8.h \
+            -o build/desktop-reference/moc_JS8.cpp
+          g++ -std=c++20 -O2 -pthread \
+            -Idesktop -Idesktop/vendor -Ibuild/desktop-reference \
+            $(pkg-config --cflags Qt6Core fftw3f) \
+            tools/reference/desktop_wav_reference.cpp \
+            desktop/JS8_Mode/FrequencyTracker.cpp \
+            build/desktop-reference/moc_JS8.cpp \
+            $(pkg-config --libs Qt6Core fftw3f) \
+            -lfftw3f_threads -o build/desktop-reference/wav-reference
+
+      - name: Download pinned waveform fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p build/wav-fixtures
+          FIXTURE_COMMIT=f1021126bdf9c4979c7213515b91f421d820a261
+          for file in A_1_4.wav A_2_1.wav A_2_3.wav A_2_5.wav A_2_6.wav A_2_9.wav A_3_3.wav E_1_1.wav E_2_1.wav; do
+            curl -fL --retry 3 --silent --show-error \
+              "https://raw.githubusercontent.com/punk-kaos/JS8Call-improved/$FIXTURE_COMMIT/media/tests/$file" \
+              -o "build/wav-fixtures/$file"
+          done
+
+      - name: Capture complete decode results from both implementations
+        run: |
+          set -euo pipefail
+          ./build/js8core-wav-decode-test --records A build/wav-fixtures/A_*.wav > build/js8core-a.tsv
+          ./build/js8core-wav-decode-test --records E build/wav-fixtures/E_*.wav > build/js8core-e.tsv
+          ./build/desktop-reference/wav-reference A build/wav-fixtures/A_*.wav > build/desktop-a.tsv
+          ./build/desktop-reference/wav-reference E build/wav-fixtures/E_*.wav > build/desktop-e.tsv
+          cat build/js8core-a.tsv build/js8core-e.tsv > build/core-records.tsv
+          cat build/desktop-a.tsv build/desktop-e.tsv > build/desktop-records.tsv
+
+      - name: Compare all decoded text and signal metadata
+        run: |
+          python3 tools/reference/compare_wav_results.py \
+            --desktop build/desktop-records.tsv \
+            --core build/core-records.tsv \
+            --freq-hz 3 --dt-seconds 0.15 --snr-db 6 --quality 0.30
+
+      - name: Preserve reference and candidate outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-decoder-parity
+          path: |
+            build/core-records.tsv
+            build/desktop-records.tsv
+          if-no-files-found: ignore
