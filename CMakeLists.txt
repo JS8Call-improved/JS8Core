@@ -55,6 +55,11 @@ target_include_directories(js8core
 )
 target_link_libraries(js8core PUBLIC Threads::Threads)
 
+# Android: resolve the guarded __android_log_print() calls in the decoder.
+if(ANDROID)
+  target_link_libraries(js8core PUBLIC log)
+endif()
+
 # External dependencies used by specific TUs. These are header-only / system
 # libs; discover them via common local include paths (e.g. Homebrew).
 # NOTE: these are needed only to build the full library in-tree here; the

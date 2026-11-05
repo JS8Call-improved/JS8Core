@@ -17,7 +17,8 @@ constexpr std::uint8_t kInvalidWord = 0xFF;
 
 constexpr std::array<std::uint8_t, 256> build_word_table() {
   std::array<std::uint8_t, 256> table{};
-  table.fill(kInvalidWord);
+  // Manual fill: std::array::fill is not constexpr in older NDK libc++.
+  for (std::size_t i = 0; i < table.size(); ++i) table[i] = kInvalidWord;
   for (std::size_t i = 0; i < data::kAlphabet.size(); ++i) {
     table[static_cast<std::uint8_t>(data::kAlphabet[i])] =
         static_cast<std::uint8_t>(i);
