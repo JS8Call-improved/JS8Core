@@ -27,10 +27,16 @@ Third-party components:
   CRCpp-compatible shim
   License: MIT
   Location: vendor/CRCpp/CRC.h
+  crc.h is CRC++, copyright (c) 2016 Daniel Bahr. It retains the BSD 3-Clause
+  license reproduced in that file.
 
   Android log fallback shim
   License: MIT
   Location: vendor/android/log.h
+  
+  JS8Call-derived dictionary and varicode sources
+  License: MIT
+  Location: src/protocol
 
 This notice does not certify the licensing of copied protocol compilations.
 The MIT license applies to project-authored implementation code; third-party

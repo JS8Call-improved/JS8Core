@@ -1,3 +1,13 @@
+/**
+ * This file is part of jsc, extracted from JS8Call.
+ *
+ * Copyright (C) 2018 Jordan Sherer <kn4crd@gmail.com>
+ * Extracted for standalone tooling in 2026.
+ * SPDX-License-Identifier: MIT
+ *
+ * Licensed under the MIT License. See LICENSE for details.
+ **/
+
 #include "js8core/protocol/jsc.hpp"
 
 #include <algorithm>

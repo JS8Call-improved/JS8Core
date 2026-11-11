@@ -25,10 +25,8 @@ receiver.
 
 The JSC indexed dictionary is a *compatibility corpus*, not newly authored
 prose. The historical dictionary compilation's source was JS8Call/Jordan
-Sherer's JSC material. Whether a particular dictionary compilation has
-separate protected selection or arrangement, and how it may be distributed,
-must be cleared independently. This document does **not** purport to grant
-third-party rights.
+Sherer's JSC material. It is relicensed MIT for this library. See LICENSE
+and NOTICE for details.
 
 ## Non-wire policy, now isolated
 
