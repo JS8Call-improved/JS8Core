@@ -1,4 +1,19 @@
 #include "js8core/protocol/submode.hpp"
+#include "js8core/decoder.hpp"
+
+static_assert(js8core::EngineConfig{}.symbol_tracking == js8core::SymbolTracking::Both);
+static_assert(js8core::EngineConfig{}.tracked_sic);
+
 int main() {
-  return js8core::protocol::submodes().empty() ? 1 : 0;
+  if (js8core::protocol::submodes().empty()) return 1;
+  auto const legacy_binding = &js8core::legacy_decode;
+  js8core::DecodeState state; // No active submodes: no sample buffer is required.
+  if (legacy_binding(state, {}) != 0) return 2;
+  js8core::DecodeControl control;
+  control.cancel_requested = [] { return true; };
+  bool canceled = false;
+  js8core::decode_with_control(state, [&](auto const& event) {
+    if (auto summary = std::get_if<js8core::events::DecodeFinished>(&event)) canceled = summary->canceled;
+  }, control);
+  return canceled ? 0 : 3;
 }

@@ -196,10 +196,13 @@ class Js8EngineImpl final : public Js8Engine {
       : config_(std::move(config)),
         callbacks_(std::move(callbacks)),
         deps_(deps) {
+    config_.optional_decode_budget_ms = std::clamp(config_.optional_decode_budget_ms, 0, 10000);
     ring_.samples.resize(kRingFrames);
     ring_.params.nfa = 200;
     ring_.params.nfb = 2500;
     ring_.params.nfqso = 1500;
+    ring_.params.symbol_tracking = config_.symbol_tracking;
+    ring_.params.tracked_sic = config_.tracked_sic;
 
     align_ring(aligned_now());
 
@@ -224,6 +227,7 @@ class Js8EngineImpl final : public Js8Engine {
   }
 
   bool start() override {
+    std::uint64_t session = 0;
     {
       std::lock_guard<std::mutex> lock(lifecycle_mutex_);
       if (lifecycle_state_ == LifecycleState::Running) return true;
@@ -231,7 +235,7 @@ class Js8EngineImpl final : public Js8Engine {
       lifecycle_state_ = LifecycleState::Starting;
       lifecycle_owner_ = std::this_thread::get_id();
       cancel_start_ = false;
-      session_generation_.fetch_add(1, std::memory_order_acq_rel);
+      session = session_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
       awaiting_first_buffer_.store(true);
       running_.store(true);
     }
@@ -253,10 +257,13 @@ class Js8EngineImpl final : public Js8Engine {
 
       input_started = deps_.audio_in->start(
           params,
-          [this](AudioInputBuffer const& buffer) {
-            if (running_.load()) submit_capture(buffer);
+          [this, session](AudioInputBuffer const& buffer) {
+            if (running_.load() && session == session_generation_.load(std::memory_order_acquire))
+              submit_capture_for_session(buffer, session);
           },
-          [this](std::string_view message) { report_error(message); });
+          [this, session](std::string_view message) {
+            if (running_.load() && session == session_generation_.load(std::memory_order_acquire)) report_error(message);
+          });
       // Legacy start() reports adapter errors but remains usable for manual
       // submit_capture() even when the device audio adapter cannot start.
       if (!input_started) report_error("Failed to start audio input");
@@ -405,6 +412,10 @@ class Js8EngineImpl final : public Js8Engine {
   }
 
   bool submit_capture(AudioInputBuffer const& buffer) override {
+    return submit_capture_for_session(buffer, session_generation_.load(std::memory_order_acquire));
+  }
+
+  bool submit_capture_for_session(AudioInputBuffer const& buffer, std::uint64_t capture_session) {
     // The original manual-input API accepts valid buffers before start() and
     // after stop(). Session-aware workers still suppress stale callbacks.
     if (buffer.format.sample_type != SampleType::Int16) {
@@ -431,6 +442,9 @@ class Js8EngineImpl final : public Js8Engine {
     // deliver sequential buffers.
     std::vector<std::string> deferred_logs;
     std::unique_lock<std::mutex> capture_guard(capture_mutex_);
+    // A callback that entered before stop/restart must not consume the new
+    // session's first-buffer marker or publish its old audio into that session.
+    if (capture_session != session_generation_.load(std::memory_order_acquire)) return true;
 
     bool const stamped = buffer.captured_at != SteadyTimePoint{};
     bool const first = awaiting_first_buffer_.exchange(false);
@@ -551,11 +565,11 @@ class Js8EngineImpl final : public Js8Engine {
       auto const now = std::chrono::steady_clock::now();
       if (now - last_spectrum_time_ >= kSpectrumInterval) {
         last_spectrum_time_ = now;
-        queue_spectrum(samples, frames, channels, buffer.format.sample_rate);
+        queue_spectrum(samples, frames, channels, buffer.format.sample_rate, capture_session);
       }
     }
 
-    schedule_decodes(&deferred_logs);
+    schedule_decodes(&deferred_logs, capture_session);
     capture_guard.unlock();
     for (auto const& message : deferred_logs) {
       if (callbacks_.on_log) log_info(message);
@@ -814,6 +828,8 @@ class Js8EngineImpl final : public Js8Engine {
     std::uint64_t epoch = 0;
     std::int64_t frames_at_request = 0;
     std::uint64_t session = 0;
+    SteadyTimePoint enqueued_at{};
+    std::int64_t oldest_frame = 0;
   };
 
   struct SpectrumTask {
@@ -822,11 +838,13 @@ class Js8EngineImpl final : public Js8Engine {
     int channels = 1;
     int sample_rate = 0;
     std::uint64_t session = 0;
+    std::uint64_t epoch = 0;
   };
 
   struct PendingEvent {
     events::Variant event;
     std::uint64_t session = 0;
+    std::uint64_t epoch = 0;
   };
 
   // Invalidates asynchronous decode/spectrum work when a session ends.
@@ -836,6 +854,7 @@ class Js8EngineImpl final : public Js8Engine {
     {
       std::lock_guard<std::mutex> lock(decode_mutex_);
       decode_queue_.clear();
+      decode_pressure_.store(false, std::memory_order_release);
     }
     {
       std::lock_guard<std::mutex> lock(spectrum_mutex_);
@@ -896,6 +915,12 @@ class Js8EngineImpl final : public Js8Engine {
                   std::vector<std::string>* deferred_logs = nullptr) {
     ring_drift_ms_ = time_drift_ms_.load();
     ++capture_epoch_;
+    {
+      std::lock_guard<std::mutex> lock(decode_mutex_);
+      decode_queue_.clear();
+      decode_pressure_.store(false, std::memory_order_release);
+    }
+    event_cv_.notify_all();
     std::fill(ring_.samples.begin(), ring_.samples.end(), 0);
 
     const auto minute_phase = detail::slot_clock::phase_ms(
@@ -980,7 +1005,7 @@ class Js8EngineImpl final : public Js8Engine {
     ring_.params.syncStats = sync_stats_.load();
   }
 
-  void schedule_decodes(std::vector<std::string>* deferred_logs) {
+  void schedule_decodes(std::vector<std::string>* deferred_logs, std::uint64_t session) {
     if (!callbacks_.on_event) return;
 
     int const position = ring_.params.kin;
@@ -1021,7 +1046,7 @@ class Js8EngineImpl final : public Js8Engine {
 
     fill_decode_metadata();
     enqueue_decode(DecodeRequest{ring_.params, ring_drift_ms_, capture_epoch_, total_frames_,
-                                session_generation_.load(std::memory_order_acquire)});
+                                session});
   }
 
   bool tx_permitted() {
@@ -1304,11 +1329,14 @@ class Js8EngineImpl final : public Js8Engine {
         mode->start_delay_ms, mode->tx_seconds * 1000, decoded.xdt);
   }
 
-  void emit_event(events::Variant const& event, std::uint64_t session) {
+  void emit_event(events::Variant const& event, std::uint64_t session,
+                  std::uint64_t epoch = 0, std::int64_t capture_frame = -1) {
     if (!callbacks_.on_event) return;
-    auto const current = [this, session] {
+    auto const current = [this, session, epoch, capture_frame] {
       return running_.load(std::memory_order_acquire) &&
-             session == session_generation_.load(std::memory_order_acquire);
+             session == session_generation_.load(std::memory_order_acquire) &&
+             (!epoch || epoch == capture_epoch_.load(std::memory_order_acquire)) &&
+             (capture_frame < 0 || total_frames_.load(std::memory_order_acquire) - capture_frame < kRingFrames);
     };
     if (!current()) return;
     {
@@ -1316,8 +1344,10 @@ class Js8EngineImpl final : public Js8Engine {
       if (!current()) return;
       // UI progress can be coalesced or dropped. Important results instead
       // apply backpressure to decode/spectrum workers, never to capture.
-      auto const discardable = [](PendingEvent const& item) {
-        return std::holds_alternative<events::Spectrum>(item.event) ||
+      auto const discardable = [this](PendingEvent const& item) {
+        return item.session != session_generation_.load(std::memory_order_acquire) ||
+               (item.epoch && item.epoch != capture_epoch_.load(std::memory_order_acquire)) ||
+               std::holds_alternative<events::Spectrum>(item.event) ||
                std::holds_alternative<events::SyncState>(item.event);
       };
       constexpr std::size_t kMaxPendingEvents = 128;
@@ -1327,7 +1357,7 @@ class Js8EngineImpl final : public Js8Engine {
                                   return std::holds_alternative<events::Spectrum>(item.event);
                                 });
         if (old != event_queue_.end()) {
-          *old = PendingEvent{event, session};
+          *old = PendingEvent{event, session, epoch};
           return;
         }
       }
@@ -1341,13 +1371,14 @@ class Js8EngineImpl final : public Js8Engine {
         } else {
           // Avoid unbounded memory growth without discarding decoded frames.
           // stop() clears the queue and wakes producers waiting here.
-          event_cv_.wait(lock, [&] {
-            return event_queue_.size() < kMaxPendingEvents || !current();
+          event_cv_.wait_for(lock, std::chrono::milliseconds(20), [&] {
+            return event_queue_.size() < kMaxPendingEvents || !current() ||
+                   std::any_of(event_queue_.begin(), event_queue_.end(), discardable);
           });
           if (!current()) return;
         }
       }
-      event_queue_.push_back(PendingEvent{event, session});
+      event_queue_.push_back(PendingEvent{event, session, epoch});
       if (event_dispatch_active_) return;
       event_dispatch_active_ = true;
       event_dispatch_thread_ = std::this_thread::get_id();
@@ -1368,7 +1399,8 @@ class Js8EngineImpl final : public Js8Engine {
       }
       event_cv_.notify_all();
       if (!running_.load(std::memory_order_acquire) ||
-          next.session != session_generation_.load(std::memory_order_acquire)) continue;
+          next.session != session_generation_.load(std::memory_order_acquire) ||
+          (next.epoch && next.epoch != capture_epoch_.load(std::memory_order_acquire))) continue;
       try {
         callbacks_.on_event(next.event);
       } catch (...) {
@@ -1534,6 +1566,7 @@ class Js8EngineImpl final : public Js8Engine {
       std::lock_guard<std::mutex> lock(decode_mutex_);
       decode_stop_ = true;
       decode_queue_.clear();
+      decode_pressure_.store(false, std::memory_order_release);
     }
     decode_cv_.notify_one();
     if (decode_thread_.joinable()) decode_thread_.join();
@@ -1555,7 +1588,14 @@ class Js8EngineImpl final : public Js8Engine {
 
   // Carry forward any submode windows that were ready only in the snapshot
   // being replaced.
-  static void merge_windows(DecodeParams& into, DecodeParams const& older) {
+  static std::int64_t absolute_window_start(std::int64_t end, int position) {
+    auto const behind = (end - position) % kRingFrames;
+    return end - (behind < 0 ? behind + kRingFrames : behind);
+  }
+
+  static void merge_windows(DecodeRequest& next, DecodeRequest const& previous, int active) {
+    auto& into = next.params;
+    auto const& older = previous.params;
     struct Window {
       int bit;
       int DecodeParams::*position;
@@ -1569,7 +1609,9 @@ class Js8EngineImpl final : public Js8Engine {
         {1 << static_cast<int>(SubmodeId::I), &DecodeParams::kposI, &DecodeParams::kszI},
     };
     for (auto const& window : windows) {
-      if ((older.nsubmodes & window.bit) == 0 ||
+      auto const start = absolute_window_start(previous.frames_at_request, older.*window.position);
+      if ((older.nsubmodes & active & window.bit) == 0 ||
+          next.frames_at_request - start >= kRingFrames ||
           (into.nsubmodes & window.bit) != 0) {
         continue;
       }
@@ -1580,6 +1622,7 @@ class Js8EngineImpl final : public Js8Engine {
   }
 
   void enqueue_decode(DecodeRequest snapshot) {
+    snapshot.enqueued_at = SteadyClock::now();
     {
       std::lock_guard<std::mutex> lock(decode_mutex_);
       if (!running_.load(std::memory_order_acquire) ||
@@ -1587,22 +1630,33 @@ class Js8EngineImpl final : public Js8Engine {
       if (decode_queue_.empty()) {
         decode_queue_.push_back(std::move(snapshot));
       } else {
-        merge_windows(snapshot.params, decode_queue_.back().params);
+        if (snapshot.epoch == decode_queue_.back().epoch && snapshot.session == decode_queue_.back().session)
+          merge_windows(snapshot, decode_queue_.back(), active_submodes_.load());
         decode_queue_.back() = std::move(snapshot);
       }
+      auto& queued = decode_queue_.back();
+      queued.oldest_frame = queued.frames_at_request;
+      const std::array positions{queued.params.kposA, queued.params.kposB, queued.params.kposC,
+                                  queued.params.kposE, queued.params.kposI};
+      for (std::size_t bit = 0; bit < positions.size(); ++bit)
+        if (queued.params.nsubmodes & (1 << bit))
+          queued.oldest_frame = std::min(queued.oldest_frame,
+              absolute_window_start(queued.frames_at_request, positions[bit]));
+      decode_pressure_.store(true, std::memory_order_release);
     }
     decode_cv_.notify_one();
   }
 
   void queue_spectrum(std::int16_t const* data, std::size_t frames, int channels,
-                      int sample_rate) {
+                      int sample_rate, std::uint64_t session) {
     if (!data || frames == 0 || sample_rate <= 0) return;
     std::size_t const count = std::min(frames, kSpectrumMaxInput);
     SpectrumTask task;
     task.frames = count;
     task.channels = 1;
     task.sample_rate = sample_rate;
-    task.session = session_generation_.load(std::memory_order_acquire);
+    task.session = session;
+    task.epoch = capture_epoch_.load(std::memory_order_acquire);
     task.samples.resize(count);
     for (std::size_t i = 0; i < count; ++i) {
       task.samples[i] = data[i * channels];
@@ -1629,6 +1683,7 @@ class Js8EngineImpl final : public Js8Engine {
         if (decode_stop_) return;
         request = std::move(decode_queue_.front());
         decode_queue_.pop_front();
+        decode_pressure_.store(!decode_queue_.empty(), std::memory_order_release);
       }
       if (!running_.load(std::memory_order_acquire) ||
           request.session != session_generation_.load(std::memory_order_acquire)) continue;
@@ -1646,7 +1701,7 @@ class Js8EngineImpl final : public Js8Engine {
         if (!running_.load(std::memory_order_acquire) ||
             request.session != session_generation_.load(std::memory_order_acquire) ||
             request.epoch != capture_epoch_ ||
-            total_frames_ - request.frames_at_request >= kRingFrames) {
+            total_frames_ - request.oldest_frame >= kRingFrames) {
           stale = true;
           break;
         }
@@ -1668,18 +1723,34 @@ class Js8EngineImpl final : public Js8Engine {
         log_info(message);
       }
 
-      std::size_t const count = legacy_decode(task, [this, &task, session = request.session](events::Variant const& event) {
+      DecodeControl control;
+      control.cancel_requested = [this, session = request.session, epoch = request.epoch,
+                                  frame = request.oldest_frame] {
+        return !running_.load(std::memory_order_acquire) ||
+            session != session_generation_.load(std::memory_order_acquire) ||
+            epoch != capture_epoch_.load(std::memory_order_acquire) ||
+            total_frames_.load(std::memory_order_acquire) - frame >= kRingFrames;
+      };
+      auto const deadline = request.enqueued_at + std::chrono::milliseconds(config_.optional_decode_budget_ms);
+      control.optional_allowed = [this, deadline] {
+        return !decode_pressure_.load(std::memory_order_acquire) && SteadyClock::now() < deadline;
+      };
+      std::size_t const count = decode_with_control(task, [this, &task, session = request.session,
+                                                    epoch = request.epoch,
+                                                    frame = request.oldest_frame](events::Variant const& event) {
         if (!running_.load(std::memory_order_acquire) ||
-            session != session_generation_.load(std::memory_order_acquire)) return;
+            session != session_generation_.load(std::memory_order_acquire) ||
+            epoch != capture_epoch_.load(std::memory_order_acquire) ||
+            total_frames_.load(std::memory_order_acquire) - frame >= kRingFrames) return;
         if (auto const* decoded = std::get_if<events::Decoded>(&event)) {
           auto out = *decoded;
           out.drift_ms = estimate_drift(task, out);
           out.capture_drift_ms = task.drift_ms_at_capture;
-          emit_event(events::Variant{std::move(out)}, session);
+          emit_event(events::Variant{std::move(out)}, session, epoch, frame);
           return;
         }
-        emit_event(event, session);
-      });
+        emit_event(event, session, epoch, frame);
+      }, control);
 
       if (callbacks_.on_log && running_.load(std::memory_order_acquire) &&
           request.session == session_generation_.load(std::memory_order_acquire)) {
@@ -1704,12 +1775,13 @@ class Js8EngineImpl final : public Js8Engine {
         spectrum_queue_.pop_front();
       }
       if (!running_.load(std::memory_order_acquire) ||
-          task.session != session_generation_.load(std::memory_order_acquire)) continue;
+          task.session != session_generation_.load(std::memory_order_acquire) ||
+          task.epoch != capture_epoch_.load(std::memory_order_acquire)) continue;
 
       auto& spectrum = std::get<events::Spectrum>(spectrum_event_);
       if (compute_spectrum(task.samples.data(), task.frames, task.channels,
                            task.sample_rate, spectrum)) {
-        emit_event(spectrum_event_, task.session);
+        emit_event(spectrum_event_, task.session, task.epoch);
       }
     }
   }
@@ -1723,7 +1795,7 @@ class Js8EngineImpl final : public Js8Engine {
   DecodeState ring_;
   std::vector<SlotPlan> slots_;
   int previous_position_ = 0;
-  std::int64_t total_frames_ = 0;
+  std::atomic<std::int64_t> total_frames_{0};
   int capture_log_counter_ = 0;
 
   std::atomic<std::int64_t> time_drift_ms_{0};
@@ -1736,7 +1808,7 @@ class Js8EngineImpl final : public Js8Engine {
   std::mutex capture_mutex_;
   std::optional<SteadyTimePoint> expected_capture_at_;
   bool capture_delivery_timestamps_ = false;  // Protected by capture_mutex_.
-  std::uint64_t capture_epoch_ = 0;
+  std::atomic<std::uint64_t> capture_epoch_{0};
 
   // Receive resampling. All members below are capture-thread only.
   dsp::Resampler rx_resampler_;
@@ -1816,6 +1888,7 @@ class Js8EngineImpl final : public Js8Engine {
   std::mutex decode_mutex_;
   std::condition_variable decode_cv_;
   std::deque<DecodeRequest> decode_queue_;
+  std::atomic<bool> decode_pressure_{false};
   bool decode_stop_ = false;
 
   std::thread spectrum_thread_;

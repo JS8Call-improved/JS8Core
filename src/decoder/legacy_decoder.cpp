@@ -28,6 +28,8 @@
 
 #include "decoder_tables.hpp"
 #include "ldpc.hpp"
+#include "symbol_tracking.hpp"
+#include "tracked_reference.hpp"
 
 namespace js8core {
 
@@ -111,7 +113,8 @@ class ChannelDecoder {
   ChannelDecoder() { initialize(); }
 
   std::size_t operator()(dec_data const& data, int position, int size,
-                         EventEmitter emit);
+                         EventEmitter emit, std::size_t& tracked_cancellations,
+                         DecodeControl const& control);
 
  private:
   using Spectrum = std::array<std::complex<float>, Mode::fft_span / 2 + 1>;
@@ -133,12 +136,17 @@ class ChannelDecoder {
 
   // --- Synchronization and demodulation ------------------------------------
 
-  std::vector<Candidate> find_candidates(int low_hz, int high_hz);
+  std::vector<Candidate> find_candidates(int low_hz, int high_hz,
+      DecodeControl const* control = nullptr, bool optional = false);
   float alignment_score(int offset, float frequency_delta);
   std::optional<Frame> attempt_decode(bool sync_stats, bool subtract,
                                       float& frequency, float& offset,
                                       int& hard_errors, float& snr,
-                                      int& rescue_budget, EventEmitter emit);
+                                      int& rescue_budget, EventEmitter emit,
+                                      SymbolTracking tracking = SymbolTracking::Disabled,
+                                      int received_samples = 0,
+                                      std::optional<decoder::TrackedTrajectory>* trajectory = nullptr,
+                                      DecodeControl const* control = nullptr);
 
   // --- Signal reconstruction -----------------------------------------------
 
@@ -450,13 +458,14 @@ float ChannelDecoder<Mode>::alignment_score(int offset, float frequency_delta) {
 
 template <typename Mode>
 std::vector<Candidate> ChannelDecoder<Mode>::find_candidates(int low_hz,
-                                                             int high_hz) {
+    int high_hz, DecodeControl const* control, bool optional) {
   // Invalid or inverted bands must not reach the polynomial baseline fit or
   // be turned into negative/huge vector allocation sizes.
   if (low_hz >= high_hz || high_hz <= 0 || low_hz > 4910) return {};
   average_spectrum_.fill(0.0f);
 
   for (int j = 0; j < Mode::spectra; ++j) {
+    if (control && (control->is_canceled() || (optional && !control->allow_optional()))) return {};
     int const start = j * Mode::time_step;
     int const stop = start + Mode::fft_span;
     if (stop > Mode::nmax) break;
@@ -501,6 +510,7 @@ std::vector<Candidate> ChannelDecoder<Mode>::find_candidates(int low_hz,
   entries.reserve(static_cast<std::size_t>(last - first + 1));
 
   for (int bin = first; bin <= last; ++bin) {
+    if (control && (control->is_canceled() || (optional && !control->allow_optional()))) return {};
     float best = -std::numeric_limits<float>::infinity();
     int best_offset = -Mode::search_radius;
 
@@ -592,7 +602,15 @@ std::vector<Candidate> ChannelDecoder<Mode>::find_candidates(int low_hz,
 template <typename Mode>
 std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
     bool sync_stats, bool subtract, float& frequency, float& offset,
-    int& hard_errors, float& snr, int& rescue_budget, EventEmitter emit) {
+    int& hard_errors, float& snr, int& rescue_budget, EventEmitter emit,
+    SymbolTracking tracking, int received_samples,
+    std::optional<decoder::TrackedTrajectory>* trajectory, DecodeControl const* control) {
+  if (trajectory) trajectory->reset();
+  auto allowed = [&] {
+    return !control || (!control->is_canceled() &&
+        (tracking == SymbolTracking::Disabled || control->allow_optional()));
+  };
+  if (!allowed()) return std::nullopt;
   constexpr float frequency_resolution = 12000.0f / Mode::fft_span;
   constexpr float down_rate = 12000.0f / Mode::downsample_factor;
   constexpr float down_period = 1.0f / down_rate;
@@ -602,6 +620,7 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
       std::pow(10.0f, 0.1f * (average_spectrum_[static_cast<std::size_t>(bin)] -
                               Mode::baseline_offset));
 
+  float const acquisition_frequency = frequency;
   extract_channel(frequency);
 
   int origin = static_cast<int>(std::round((offset + Mode::start_seconds) * down_rate));
@@ -645,10 +664,49 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
 
   std::array<std::array<float, kChannelSymbols>, kToneRows> tone_power{};
 
+  std::vector<std::complex<float>> tracked_symbols;
+  std::optional<decoder::TrackedTrajectory> fitted_trajectory;
+  if (tracking != SymbolTracking::Disabled) {
+    // Re-extract the unmodified channel: the established path rotates only its
+    // legacy payload prefix. Tracking needs the full received frame and margins.
+    extract_channel(acquisition_frequency);
+    int const available = std::clamp(received_samples / Mode::downsample_factor,
+                                     0, Mode::ds_fft_out);
+    std::vector<std::complex<float>> tracking_channel(channel_.begin(), channel_.begin() + available);
+    for (int i = 0; i < available; ++i)
+      tracking_channel[static_cast<std::size_t>(i)] *=
+          std::polar(1.0f, -kTau * best_delta * (i + 1) / down_rate);
+    auto estimate = decoder::estimate_pilot_tracking(
+        tracking_channel, down_rate, Mode::downsample_sps, best_time, kCostas, control);
+    if (tracking == SymbolTracking::Frequency) estimate.timing_valid = false;
+    if (tracking == SymbolTracking::Timing) estimate.frequency_valid = false;
+    if (!estimate.frequency_valid && !estimate.timing_valid) return std::nullopt;
+    tracked_symbols = decoder::extract_tracked_symbols(
+        tracking_channel, down_rate, Mode::downsample_sps, best_time, estimate, control);
+    if (tracked_symbols.empty()) return std::nullopt;
+    constexpr float channel_resolution = 12000.0f / Mode::ds_fft_span;
+    frequency = std::round(acquisition_frequency / channel_resolution) * channel_resolution + best_delta;
+    if (estimate.frequency_valid) frequency += static_cast<float>(estimate.frequency_at_start_hz);
+    if (estimate.timing_valid) offset += static_cast<float>(estimate.timing_at_start_samples / down_rate);
+    if (trajectory && estimate.frequency_valid && estimate.timing_valid) {
+      fitted_trajectory = decoder::TrackedTrajectory{
+          12000.0, Mode::nsps, static_cast<double>(best_time * Mode::downsample_factor),
+          frequency, estimate.frequency_hz_per_symbol,
+          estimate.timing_at_start_samples * Mode::downsample_factor,
+          estimate.timing_samples_per_symbol * Mode::downsample_factor};
+    }
+    // The fixed reference cannot represent a tracked timing/frequency trajectory.
+    subtract = false;
+  }
+
   for (int symbol = 0; symbol < kChannelSymbols; ++symbol) {
+    if (!allowed()) return std::nullopt;
     int const start = best_time + symbol * Mode::downsample_sps;
     symbol_fft_.fill(kZero);
-    if (start >= 0 && start + Mode::downsample_sps <= Mode::payload_samples) {
+    if (!tracked_symbols.empty()) {
+      auto const first = tracked_symbols.begin() + symbol * Mode::downsample_sps;
+      std::copy_n(first, Mode::downsample_sps, symbol_fft_.begin());
+    } else if (start >= 0 && start + Mode::downsample_sps <= Mode::payload_samples) {
       std::copy(channel_.begin() + start,
                 channel_.begin() + start + Mode::downsample_sps,
                 symbol_fft_.begin());
@@ -763,6 +821,7 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
   std::array<std::int8_t, kCodeLength> codeword{};
 
   for (int pass = 1; pass <= 5; ++pass) {
+    if (!allowed()) return std::nullopt;
     std::array<float, 3 * kDataSymbols> rescue_llr{};
     if (pass == 5) {
       // Rare weak candidates may need more iterations after the early-stall
@@ -802,13 +861,14 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
     }
 
     if (!decoder::crc_ok(payload)) continue;
+    if (!allowed()) return std::nullopt;
 
     if (sync_stats) {
       events::SyncState event;
       event.kind = events::SyncState::Kind::Decoded;
       event.mode = Mode::event_mode;
       event.frequency = frequency;
-      event.dt = refined_offset;
+      event.dt = offset;
       event.sync.decoded = sync;
       emit(event);
     }
@@ -832,6 +892,8 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
                                                1.259e-10f)) - 32.0f,
                    -60.0f);
 
+    // Never return a cancellation trajectory for a failed or non-CRC attempt.
+    if (trajectory) *trajectory = fitted_trajectory;
     return Frame{type, text};
   }
 
@@ -911,7 +973,10 @@ void ChannelDecoder<Mode>::subtract_reference(
 
 template <typename Mode>
 std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
-                                             int size, EventEmitter emit) {
+                                             int size, EventEmitter emit,
+                                             std::size_t& tracked_cancellations,
+                                             DecodeControl const& control) {
+  if (control.is_canceled()) return 0;
   int const pos = std::max(0, position);
   int const count = std::clamp(size, 0, Mode::nmax);
   if (pos >= kJs8NtMax * kJs8RxSampleRate || count == 0) return 0;
@@ -944,7 +1009,8 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
   int rescue_budget = 32;
 
   for (int pass = 1; pass <= 3; ++pass) {
-    auto candidates = find_candidates(data.params.nfa, data.params.nfb);
+    if (control.is_canceled()) break;
+    auto candidates = find_candidates(data.params.nfa, data.params.nfb, &control);
     if (candidates.empty()) break;
 
     int const preferred = data.params.nfqso;
@@ -963,13 +1029,15 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
     bool improved = false;
 
     for (auto candidate : candidates) {
+      if (control.is_canceled()) break;
       float frequency = candidate.frequency;
       float offset = candidate.offset;
       int hard_errors = -1;
       float snr = 0.0f;
 
       auto frame = attempt_decode(data.params.syncStats, subtract, frequency,
-                                  offset, hard_errors, snr, rescue_budget, emit);
+                                  offset, hard_errors, snr, rescue_budget, emit,
+                                  SymbolTracking::Disabled, 0, nullptr, &control);
       if (!frame) continue;
 
       int const rounded_snr = static_cast<int>(std::round(snr));
@@ -992,13 +1060,100 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
     if (!improved) break;
   }
 
+  // Run optional tracking only after every established SIC pass. Its separate
+  // budgets cannot consume legacy rescue work or change legacy subtraction.
+  if (data.params.symbol_tracking == SymbolTracking::Frequency ||
+      data.params.symbol_tracking == SymbolTracking::Timing ||
+      data.params.symbol_tracking == SymbolTracking::Both) {
+    std::vector<std::pair<Frame, decoder::TrackedTrajectory>> pending;
+    auto tracking_pass = [&](bool after_cancellation) {
+      if (!control.allow_optional()) return;
+      auto const candidates = find_candidates(data.params.nfa, data.params.nfb, &control, true);
+      if (!control.allow_optional()) return;
+      prepare_baseband();  // SIC may have changed samples since the previous FFT.
+      int tracking_budget = 8;
+      int tracking_rescue_budget = 8;
+      for (auto const& candidate : candidates) {
+        if (!control.allow_optional()) return;
+        // A whole-frame track cannot be established from a window that cannot
+        // contain all symbols even after acquisition and tracking displacements.
+        float const nominal_start = (candidate.offset + Mode::start_seconds) * kJs8RxSampleRate;
+        int const margin = 8 * Mode::downsample_factor;
+        if (nominal_start + Mode::nsps / 2.0f < margin ||
+            nominal_start - Mode::nsps / 2.0f + kChannelSymbols * Mode::nsps + margin > count)
+          continue;
+        if (tracking_budget <= 0) break;
+        // Candidate suppression can discard an adjacent half-tone FFT bin which
+        // is a better center for a drifting frame. Revisit those two bins within
+        // the same overall attempt budget, without relaxing pilot acceptance.
+        for (float bin_shift : {0.0f, -0.5f, 0.5f}) {
+          if (!control.allow_optional()) return;
+          if (tracking_budget <= 0) break;
+          float frequency = candidate.frequency + bin_shift * (12000.0f / Mode::nsps);
+          if (frequency < 100.0f || frequency > 4910.0f) continue;
+          --tracking_budget;
+          float offset = candidate.offset, snr = 0.0f;
+          int hard_errors = -1;
+          std::optional<decoder::TrackedTrajectory> trajectory;
+          auto frame = attempt_decode(data.params.syncStats, false, frequency, offset,
+                                      hard_errors, snr, tracking_rescue_budget, emit,
+                                      data.params.symbol_tracking, count,
+                                      data.params.tracked_sic && !after_cancellation ? &trajectory : nullptr,
+                                      &control);
+          if (!frame) continue;
+          if (decoded.contains(*frame)) break;
+          int const rounded_snr = static_cast<int>(std::round(snr));
+          auto [slot, inserted] = decoded.try_emplace(std::move(*frame), rounded_snr);
+          if (!inserted) break;
+          events::Decoded event{data.params.utc, rounded_snr, offset - Mode::start_seconds,
+                                frequency, slot->first.text, slot->first.type,
+                                1.0f - hard_errors / 60.0f, Mode::event_mode};
+          event.tracking_used = true;
+          event.after_tracked_sic = after_cancellation;
+          emit(event);
+          if (trajectory) pending.emplace_back(slot->first, *trajectory);
+          break;
+        }
+      }
+    };
+    // Complete the original optional pass before modifying any residual, so
+    // merely enabling tracked SIC cannot replace its existing results either.
+    tracking_pass(false);
+    if (data.params.tracked_sic && data.params.symbol_tracking == SymbolTracking::Both) {
+      bool changed = false;
+      int cancellation_budget = 2;
+      for (auto const& [frame, trajectory] : pending) {
+        if (!control.allow_optional()) break;
+        if (cancellation_budget-- <= 0) break;
+        std::array<int, kChannelSymbols> tones{};
+        legacy_encode(frame.type, kCostas, frame.text.data(), tones.data());
+        auto const reference = decoder::make_tracked_reference(tones, trajectory, count, &control);
+        if (reference.empty()) continue;
+        auto residual = decoder::cancel_tracked_reference(
+            std::span<float const>(samples_.data(), static_cast<std::size_t>(count)), reference, Mode::nsps, &control);
+        if (residual.residual.empty() || !control.allow_optional()) continue;
+        std::copy(residual.residual.begin(), residual.residual.end(), samples_.begin());
+        ++tracked_cancellations;
+        changed = true;
+      }
+      // One bounded follow-up search; no recursive cancellation cascade.
+      if (changed) tracking_pass(true);
+    }
+  }
+
   return decoded.size();
 }
 
 }  // namespace
 
 std::size_t legacy_decode(DecodeState const& state,
-                          std::function<void(events::Variant const&)> emit_fn) {
+                           std::function<void(events::Variant const&)> emit_fn) {
+  return decode_with_control(state, std::move(emit_fn), DecodeControl{});
+}
+
+std::size_t decode_with_control(DecodeState const& state,
+                          std::function<void(events::Variant const&)> emit_fn,
+                          DecodeControl const& requested) {
   static thread_local std::unique_ptr<ChannelDecoder<ProfileA>> decoder_a;
   static thread_local std::unique_ptr<ChannelDecoder<ProfileB>> decoder_b;
   static thread_local std::unique_ptr<ChannelDecoder<ProfileC>> decoder_c;
@@ -1009,11 +1164,25 @@ std::size_t legacy_decode(DecodeState const& state,
     if (emit_fn) emit_fn(event);
   };
 
+  std::size_t tracked_cancellations = 0;
+  bool canceled = false, skipped = false;
+  DecodeControl control;
+  if (requested.cancel_requested || requested.optional_allowed) {
+    control.cancel_requested = [&] { canceled = canceled || requested.is_canceled(); return canceled; };
+    control.optional_allowed = [&] {
+      if (!skipped) {
+        try { skipped = requested.optional_allowed && !requested.optional_allowed(); }
+        catch (...) { skipped = true; }
+      }
+      return !skipped;
+    };
+  }
+
   auto run = [&](auto& decoder, int position, int size) {
     using Decoder =
         typename std::remove_reference_t<decltype(decoder)>::element_type;
     if (!decoder) decoder = std::make_unique<Decoder>();
-    return (*decoder)(state, position, size, emit);
+    return (*decoder)(state, position, size, emit, tracked_cancellations, control);
   };
 
   int const submodes = state.params.nsubmodes;
@@ -1037,7 +1206,8 @@ std::size_t legacy_decode(DecodeState const& state,
     total += run(decoder_a, state.params.kposA, state.params.kszA);
   }
 
-  emit(events::DecodeFinished{total});
+  control.is_canceled();
+  emit(events::DecodeFinished{total, tracked_cancellations, skipped, canceled});
   return total;
 }
 

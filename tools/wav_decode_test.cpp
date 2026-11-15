@@ -3,9 +3,11 @@
 #include <filesystem>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "js8core/decoder.hpp"
@@ -32,43 +34,60 @@ std::uint16_t read_u16(std::ifstream& in) {
 }
 
 bool load_wav(std::string const& path, std::vector<std::int16_t>& samples) {
-  std::ifstream in(path, std::ios::binary);
+  samples.clear();
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
   if (!in) return false;
+  auto const file_size = in.tellg();
+  if (file_size < 12) return false;
+  in.seekg(0);
 
   char riff[4]{};
   in.read(riff, 4);
   if (std::memcmp(riff, "RIFF", 4) != 0) return false;
-  read_u32(in);
+  std::uint64_t const riff_end = 8ull + read_u32(in);
+  if (riff_end < 12 || riff_end > static_cast<std::uint64_t>(file_size)) return false;
   char wave[4]{};
   in.read(wave, 4);
   if (std::memcmp(wave, "WAVE", 4) != 0) return false;
 
-  std::uint16_t channels = 0;
-  std::uint16_t bits = 0;
-  std::uint32_t rate = 0;
+  bool pcm = false;
 
-  while (in) {
+  while (in && static_cast<std::uint64_t>(in.tellg()) + 8 <= riff_end) {
     char id[4]{};
     in.read(id, 4);
     if (!in) break;
     std::uint32_t size = read_u32(in);
+    std::uint64_t const payload = static_cast<std::uint64_t>(in.tellg());
+    if (!in || size > riff_end - payload) return false;
+    std::uint64_t const next = payload + size + (size & 1u);
+    if (next > riff_end) return false;
 
     if (std::memcmp(id, "fmt ", 4) == 0) {
-      read_u16(in);  // format
-      channels = read_u16(in);
-      rate = read_u32(in);
-      read_u32(in);  // byte rate
-      read_u16(in);  // block align
-      bits = read_u16(in);
-      in.seekg(static_cast<std::streamoff>(size) - 16, std::ios::cur);
+      if (size < 16) return false;
+      auto const format = read_u16(in);
+      auto const channels = read_u16(in);
+      auto const rate = read_u32(in);
+      auto const byte_rate = read_u32(in);
+      auto const alignment = read_u16(in);
+      auto const bits = read_u16(in);
+      pcm = format == 1 && channels == 1 && rate == 12000 &&
+            byte_rate == 24000 && alignment == 2 && bits == 16;
+      if (!in || !pcm) return false;
     } else if (std::memcmp(id, "data", 4) == 0) {
-      if (channels != 1 || bits != 16 || rate != 12000) return false;
+      constexpr std::uint32_t max_bytes = 2 * kJs8NtMax * kJs8RxSampleRate;
+      if (!pcm || size == 0 || (size & 1u) || size > max_bytes) return false;
+      std::vector<unsigned char> bytes(size);
+      in.read(reinterpret_cast<char*>(bytes.data()), size);
+      if (!in) return false;
       samples.resize(size / 2);
-      in.read(reinterpret_cast<char*>(samples.data()), size);
+      for (std::size_t i = 0; i < samples.size(); ++i) {
+        auto const word = static_cast<std::uint16_t>(bytes[2 * i]) |
+            (static_cast<std::uint16_t>(bytes[2 * i + 1]) << 8);
+        samples[i] = static_cast<std::int16_t>(word);
+      }
       return true;
-    } else {
-      in.seekg(size, std::ios::cur);
     }
+    in.seekg(static_cast<std::streamoff>(next));
   }
   return false;
 }
@@ -86,14 +105,39 @@ std::string hex_text(std::string const& payload) {
   return hex;
 }
 
+bool same_frame(events::Decoded const& a, events::Decoded const& b) {
+  return a.data == b.data && a.type == b.type && a.utc == b.utc && a.mode == b.mode &&
+      a.snr == b.snr && a.frequency == b.frequency && a.xdt == b.xdt && a.quality == b.quality &&
+      a.drift_ms == b.drift_ms && a.capture_drift_ms == b.capture_drift_ms &&
+      a.tracking_used == b.tracking_used && a.after_tracked_sic == b.after_tracked_sic;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  const bool records = argc > 1 && std::strcmp(argv[1], "--records") == 0;
-  const int mode_arg = records ? 2 : 1;
-  if (argc < mode_arg + 2) {
+  bool records = false, wrap = false, valid = true, tracked_sic = false;
+  SymbolTracking tracking = SymbolTracking::Disabled;
+  int mode_arg = 1;
+  while (mode_arg < argc && std::string_view(argv[mode_arg]).starts_with("--") && valid) {
+    std::string_view option(argv[mode_arg++]);
+    if (option == "--records") records = true;
+    else if (option == "--wrap") wrap = true;
+    else if (option == "--tracked-sic") tracked_sic = true;
+    else if (option == "--tracking" && mode_arg < argc) {
+      std::string_view value(argv[mode_arg++]);
+      if (value == "disabled") tracking = SymbolTracking::Disabled;
+      else if (value == "frequency") tracking = SymbolTracking::Frequency;
+      else if (value == "timing") tracking = SymbolTracking::Timing;
+      else if (value == "both") tracking = SymbolTracking::Both;
+      else valid = false;
+    } else valid = false;
+  }
+  if (!valid || argc < mode_arg + 2 ||
+      (std::string_view(argv[mode_arg]) != "A" && std::string_view(argv[mode_arg]) != "a" &&
+       std::string_view(argv[mode_arg]) != "E" && std::string_view(argv[mode_arg]) != "e")) {
     std::fprintf(stderr,
-                 "usage: %s [--records] <mode A|E> <file.wav>...\n", argv[0]);
+                 "usage: %s [--records] [--tracking disabled|frequency|timing|both] "
+                 "[--wrap] [--tracked-sic] <mode A|E> <file.wav>...\n", argv[0]);
     return 2;
   }
 
@@ -109,6 +153,10 @@ int main(int argc, char** argv) {
     }
 
     DecodeState state;
+    // Preserve the recorder/comparator's disabled baseline regardless of the
+    // production defaults. Explicit CLI switches select the candidate path.
+    state.params.symbol_tracking = SymbolTracking::Disabled;
+    state.params.tracked_sic = false;
     state.samples.assign(static_cast<std::size_t>(kJs8NtMax * kJs8RxSampleRate), 0);
     // Reject oversized input rather than writing beyond the 60-second ring.
     if (samples.size() > state.samples.size()) {
@@ -122,43 +170,96 @@ int main(int argc, char** argv) {
     state.params.nfqso = 1500;
     state.params.utc = 0;
 
-    int count = 0;
+    int const window_start = wrap ? (kJs8NtMax - 1) * kJs8RxSampleRate : 0;
+    if (wrap) std::rotate(state.samples.begin(), state.samples.begin() + kJs8RxSampleRate,
+                           state.samples.end());
     if (mode == 'A' || mode == 'a') {
       state.params.nsubmodes = 1 << 0;
-      state.params.kposA = 0;
-      state.params.kszA = 15 * kJs8RxSampleRate;
+      state.params.kposA = window_start;
+      state.params.kszA = static_cast<int>(std::min<std::size_t>(samples.size(), 15 * kJs8RxSampleRate));
     } else if (mode == 'E' || mode == 'e') {
       state.params.nsubmodes = 1 << 3;
-      state.params.kposE = 0;
-      state.params.kszE = 30 * kJs8RxSampleRate;
+      state.params.kposE = window_start;
+      state.params.kszE = static_cast<int>(std::min<std::size_t>(samples.size(), 30 * kJs8RxSampleRate));
     } else {
       std::fprintf(stderr, "unknown mode %c\n", mode);
       return 2;
     }
 
     const auto basename = std::filesystem::path(argv[arg]).filename().string();
-    legacy_decode(state, [&](events::Variant const& ev) {
-      if (auto const* decoded = std::get_if<events::Decoded>(&ev)) {
-        ++count;
-        if (records) {
-          const auto hex = hex_text(decoded->data);
-          // Common desktop/JS8Core record layout:
-          // file, frame type, mode, SNR dB, audio Hz, DT seconds,
-          // quality, hexadecimal UTF-8 payload.
-          std::printf("RECORD\t%s\t%d\t%d\t%d\t%.4f\t%.4f\t%.4f\t%s\n",
-                      basename.c_str(), decoded->type, decoded->mode, decoded->snr,
-                      decoded->frequency, decoded->xdt, decoded->quality,
-                      hex.c_str());
-        } else {
-          std::printf("  %s\n", decoded->data.c_str());
+    std::size_t cancellations = 0;
+    auto run = [&](std::vector<events::Decoded>& results) {
+      cancellations = 0;
+      auto const start = std::chrono::steady_clock::now();
+      legacy_decode(state, [&](events::Variant const& event) {
+        if (auto const* d = std::get_if<events::Decoded>(&event)) results.push_back(*d);
+        if (auto const* f = std::get_if<events::DecodeFinished>(&event)) cancellations = f->tracked_cancellations;
+      });
+      return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    };
+    std::vector<events::Decoded> baseline;
+    double const baseline_ms = run(baseline);
+    std::vector<events::Decoded> results = baseline;
+    double enabled_ms = baseline_ms;
+    if (tracking != SymbolTracking::Disabled) {
+      state.params.symbol_tracking = tracking;
+      results.clear();
+      enabled_ms = run(results);
+      if (tracked_sic) {
+        auto const tracking_only = results;
+        state.params.tracked_sic = true;
+        results.clear();
+        enabled_ms = run(results);
+        if (results.size() < tracking_only.size() ||
+            !std::equal(tracking_only.begin(), tracking_only.end(), results.begin(), same_frame)) {
+          std::fprintf(stderr, "%s: tracked SIC changed the no-cancellation results\n", basename.c_str());
+          ++failures;
         }
       }
-    });
+      bool preserved = results.size() >= baseline.size();
+      for (std::size_t i = 0; preserved && i < baseline.size(); ++i) {
+        preserved = same_frame(baseline[i], results[i]);
+      }
+      for (std::size_t i = baseline.size(); preserved && i < results.size(); ++i) {
+        auto const& d = results[i];
+        preserved = d.tracking_used && std::none_of(results.begin(), results.begin() + i,
+            [&](auto const& other) { return d.type == other.type && d.data == other.data; });
+        if (d.after_tracked_sic && !cancellations) preserved = false;
+      }
+      if (!preserved) {
+        std::fprintf(stderr, "%s: tracking changed baseline results or appended invalid provenance\n", basename.c_str());
+        ++failures;
+      }
+      auto const tracked = std::count_if(results.begin(), results.end(), [](auto const& d) {
+        return d.tracking_used;
+      });
+      std::fprintf(stderr, "PAIR\t%s\t%zu\t%zu\t%td\t%.3f\t%.3f\n", basename.c_str(),
+                   baseline.size(), results.size(), tracked, baseline_ms, enabled_ms);
+    }
+    if (cancellations > 2 || ((tracking != SymbolTracking::Both || !tracked_sic) && cancellations)) {
+      std::fprintf(stderr, "%s: unexpected tracked cancellation count\n", basename.c_str());
+      ++failures;
+    }
+    if (tracked_sic) std::fprintf(stderr, "SIC\t%s\t%zu\n", basename.c_str(), cancellations);
+    int const count = static_cast<int>(baseline.size());
+    for (auto const& decoded : results) {
+      if (records) {
+        const auto hex = hex_text(decoded.data);
+        // Common desktop/JS8Core record layout:
+        // file, frame type, mode, SNR dB, audio Hz, DT seconds,
+        // quality, hexadecimal UTF-8 payload.
+        std::printf("RECORD\t%s\t%d\t%d\t%d\t%.4f\t%.4f\t%.4f\t%s\n",
+                    basename.c_str(), decoded.type, decoded.mode, decoded.snr,
+                    decoded.frequency, decoded.xdt, decoded.quality, hex.c_str());
+      } else {
+        std::printf("  %s\n", decoded.data.c_str());
+      }
+    }
 
     if (records) {
-      std::fprintf(stderr, "%s: %d JS8Core decodes\n", basename.c_str(), count);
+      std::fprintf(stderr, "%s: %zu JS8Core decodes\n", basename.c_str(), results.size());
     } else {
-      std::printf("%s: %d decodes\n", argv[arg], count);
+      std::printf("%s: %zu decodes\n", argv[arg], results.size());
     }
     // The full-record A/B comparator validates exact identities and numeric
     // metadata when --records is requested. Keep native count-only gates

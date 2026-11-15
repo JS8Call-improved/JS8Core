@@ -8,3 +8,4 @@ CMakeCache.txt
 # Build output directories (never commit artifacts)
 build/
 build_dbg/
+/build-symbol-tracking/
