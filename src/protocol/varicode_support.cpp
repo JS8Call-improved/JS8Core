@@ -297,6 +297,10 @@ bool parse_heartbeat(std::string const& text, ParsedMessage& out) {
   bool found = false;
   for (auto const& type : kTypes) {
     if (!equals_ci(text, pos, type)) continue;
+    // Whole words only, as desktop's \b: HB9ABC and CQ8ABC are callsigns,
+    // not the HB and CQ commands (they must reach the directed parser).
+    const std::size_t end = pos + type.size();
+    if (end < n && (std::isalnum(static_cast<unsigned char>(text[end])) || text[end] == '_')) continue;
     if (type == "HEARTBEAT") {
       std::size_t after = pos + type.size();
       const std::size_t spaced = skip_space(text, after);

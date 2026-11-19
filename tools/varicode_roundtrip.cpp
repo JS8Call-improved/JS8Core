@@ -196,6 +196,30 @@ int main() {
         "2E0ABC HELLO", "VE7NHW", &to, &compound, &cmd, &num, &consumed);
     check(!directed.empty() && to == "2E0ABC", "relay keeps leading digit in destination callsign");
 
+    // Callsigns that begin with HB or CQ are recipients, not beacons
+    // (HB9 is the Swiss prefix). Desktop emits a directed header and a data frame.
+    for (int mode : {0, 1, 4}) {
+      for (std::string const recipient : {"HB9ABC", "CQ8ABC"}) {
+        auto prefixed = js8core::protocol::varicode::build_message_frames(
+            "K1ABC", "FN31", recipient, "HELLO", false, false, mode, nullptr);
+        bool directed_to = false;
+        for (auto const& frame : prefixed) {
+          auto decoded = js8core::protocol::varicode::unpack_directed_message(frame.first, nullptr);
+          directed_to = directed_to || (decoded.size() >= 2 && decoded[1] == recipient);
+        }
+        check(prefixed.size() == 2 && directed_to,
+              recipient + " in submode " + std::to_string(mode) + " is a directed recipient, not a beacon");
+      }
+    }
+    for (std::string const beacon : {"HB FN31", "CQ CQ CQ FN31", "CQ DX FN31"}) {
+      auto frames_beacon = js8core::protocol::varicode::build_message_frames(
+          "K1ABC", "FN31", "", beacon, false, false, 0, nullptr);
+      std::uint8_t type = 0;
+      check(frames_beacon.size() == 1 &&
+                !js8core::protocol::varicode::unpack_heartbeat_message(frames_beacon.front().first, &type, nullptr, nullptr).empty(),
+            beacon + " is still a beacon");
+    }
+
     auto frames = js8core::protocol::varicode::build_message_frames(
         "VE7NHW", "CN89", "", "N0XYZ RR 73", false, false, 0, nullptr);
     bool saw_rr = false;
