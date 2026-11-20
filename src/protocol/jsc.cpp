@@ -144,8 +144,8 @@ std::vector<CodewordPair> compress(std::string const& text) {
       const std::uint32_t index = lookup(word, &found);
       if (!found) break;
 
-      const JscTuple& entry = JSC_MAP[index];
-      word.erase(0, static_cast<std::size_t>(entry.size));
+      const std::size_t length = jsc_word(index).size();
+      word.erase(0, length);
 
       const bool completes_word = word.empty();
       const bool add_space =
@@ -153,7 +153,7 @@ std::vector<CodewordPair> compress(std::string const& text) {
 
       encoded.emplace_back(
           build_code(index, add_space),
-          static_cast<std::uint32_t>(entry.size + (add_space ? 1 : 0)));
+          static_cast<std::uint32_t>(length + (add_space ? 1 : 0)));
     }
 
     if (last_word) break;
@@ -192,7 +192,7 @@ std::string decompress(Codeword const& bits) {
         groups[pos + count] + group_base(count);
     if (index >= JSC_SIZE) break;
 
-    text.append(JSC_MAP[index].str, static_cast<std::size_t>(JSC_MAP[index].size));
+    text.append(jsc_word(static_cast<std::uint32_t>(index)));
 
     if (next_separator < parsed.separators.size() &&
         parsed.separators[next_separator] == pos + count) {
@@ -210,7 +210,7 @@ bool exists(std::string const& w, std::uint32_t* pIndex) {
   bool found = false;
   const std::uint32_t index = lookup(w, &found);
   if (pIndex) *pIndex = index;
-  return found && JSC_MAP[index].size == static_cast<int>(w.size());
+  return found && jsc_word(index).size() == w.size();
 }
 
 // Rebuild the text -> on-air dictionary-index search table from the one
@@ -225,14 +225,11 @@ struct DictionaryIndex {
     by_text.resize(JSC_SIZE);
     std::iota(by_text.begin(), by_text.end(), 0u);
     for (auto const index : by_text)
-      max_length = std::max(max_length,
-          static_cast<std::size_t>(JSC_MAP[index].size));
+      max_length = std::max(max_length, jsc_word(index).size());
     std::sort(by_text.begin(), by_text.end(),
               [](std::uint32_t lhs, std::uint32_t rhs) {
-      auto const a = std::string_view(
-          JSC_MAP[lhs].str, static_cast<std::size_t>(JSC_MAP[lhs].size));
-      auto const b = std::string_view(
-          JSC_MAP[rhs].str, static_cast<std::size_t>(JSC_MAP[rhs].size));
+      auto const a = jsc_word(lhs);
+      auto const b = jsc_word(rhs);
       return a == b ? lhs < rhs : a < b;
     });
   }
@@ -255,13 +252,10 @@ std::uint32_t lookup(const char* text, bool* ok) {
     auto const it = std::lower_bound(
         index.by_text.begin(), index.by_text.end(), wanted,
         [](std::uint32_t candidate, std::string_view query) {
-          auto const& entry = JSC_MAP[candidate];
-          return std::string_view(entry.str,
-                   static_cast<std::size_t>(entry.size)) < query;
+          return jsc_word(candidate) < query;
         });
     if (it == index.by_text.end()) continue;
-    auto const& entry = JSC_MAP[*it];
-    if (std::string_view(entry.str, static_cast<std::size_t>(entry.size)) == wanted) {
+    if (jsc_word(*it) == wanted) {
       if (ok) *ok = true;
       return *it;
     }

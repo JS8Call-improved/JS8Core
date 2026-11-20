@@ -30,6 +30,28 @@ int main() {
     return 1;
   }
 
+  // 0) Every entry, in index order: FNV-1a over each word's 32-bit length and
+  // bytes. The value was taken from the {str, size, index} table this layout
+  // replaced, so any change to a word, a length or the order fails here.
+  {
+    std::uint32_t table = 2166136261u;
+    auto mix = [&table](unsigned char byte) {
+      table ^= byte;
+      table *= 16777619u;
+    };
+    for (std::uint32_t i = 0; i < JSC_SIZE; ++i) {
+      auto const word = jsc_word(i);
+      auto const size = static_cast<std::uint32_t>(word.size());
+      for (int shift = 0; shift < 32; shift += 8) mix(static_cast<unsigned char>(size >> shift));
+      for (char c : word) mix(static_cast<unsigned char>(c));
+    }
+    std::cout << "JSC table digest = 0x" << std::hex << table << std::dec << " (expected 0x2c2236ac)\n";
+    if (table != 0x2c2236acu) {
+      std::cerr << "FAIL: JSC table differs from the reference dictionary\n";
+      return 1;
+    }
+  }
+
   std::string const& alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?";
 
   // 1) single-character round-trip through the table.
@@ -67,8 +89,7 @@ int main() {
   };
   int parity_compared = 0;
   for (std::uint32_t i = 0; i < JSC_SIZE; i += 131) {
-    const auto& entry = JSC_MAP[i];
-    const std::string candidate(entry.str, static_cast<std::size_t>(entry.size));
+    const std::string candidate(jsc_word(i));
     for (auto const& input : {candidate, candidate + "~" + std::to_string(i)}) {
       if (input.find('\0') != std::string::npos) continue;
       bool found = false;

@@ -20,8 +20,8 @@ receiver.
 | `src/protocol/costas.cpp` | Original and modified Costas sequences | Sync tone numbers are on-air symbols |
 | `src/protocol/submode.cpp` and mode profiles | Symbol samples, starts, periods | Defines standard JS8 submodes |
 | `src/protocol/varicode_tables.hpp` | Huffman/varicode codes, directed command numbers, group-call assignments and frame identifiers | Defines interoperable message bit patterns |
-| `src/protocol/jsc_map.cpp.inc` | 262,144 index-to-word assignments | An index change alters the compressed JSC bitstream |
-| `src/protocol/jsc_data.hpp` | JSC word/index layout | Required to interpret the dictionary above |
+| `src/protocol/jsc_map.cpp.inc` | 262,144 index-to-word assignments (`JSC_TEXT` slices bounded by `JSC_OFFSETS`) | An index change alters the compressed JSC bitstream |
+| `src/protocol/jsc_data.hpp` | JSC word/index layout and `jsc_word()` accessor | Required to interpret the dictionary above |
 
 The JSC indexed dictionary is a *compatibility corpus*, not newly authored
 prose. The historical dictionary compilation's source was JS8Call/Jordan
@@ -67,14 +67,22 @@ continues through `include/js8core/` and `protocol/constants.hpp`.
   adjacency; the old duplicate table was removed. Each output check node
   lists exactly the bits associated with that parity equation, ordered by
   codeword bit index. A compile-time assertion verifies permitted degrees.
-- JSC text lookup now builds a sorted index of the retained `JSC_MAP` entries
+- JSC text lookup now builds a sorted index of the retained dictionary entries
   on first use. It uses longest-prefix matching and the original numeric
   dictionary IDs. The independently generated lookup was compared with the
   old two-table lookup on 4,004 exact and prefix inputs across the full
   262,144-index range; every result matched. The frozen FNV-1a compatibility
   digest is `0x9e32712d` and is checked by `verify_jsc_roundtrip`.
   The old approximately 6.3-MB `JSC_LIST` table and 103-entry prefix table
-  have been removed. The retained `JSC_MAP` is not reindexed.
+  have been removed. The retained dictionary is not reindexed.
+- The dictionary is stored as one byte array (`JSC_TEXT`) and 262,145 offsets
+  (`JSC_OFFSETS`) instead of a `{str, size, index}` table. The entries, their
+  order and lengths are unchanged (the dropped `index` field always equalled
+  the position). The former table held a pointer per entry, which costs one
+  dynamic relocation each in a shared library (about 10 MB on 64-bit
+  Android); the offsets need none. `verify_jsc_roundtrip` checks an FNV-1a
+  digest over every entry's length and bytes, `0x2c2236ac`, taken from the
+  former table.
 - `src/dsp/resampler.cpp:make_js8_fir()` now designs a 97-tap, symmetric,
   0.44-Nyquist-factor Blackman-windowed sinc low-pass for integer-ratio
   resampling, normalized to unity DC gain. The old desktop-specific FIR
