@@ -62,11 +62,19 @@ struct Decoded {
   // Ring alignment (ms) at capture time. The signal is on time with
   // capture_drift_ms - 1000 * xdt.
   std::int64_t capture_drift_ms = 0;
+  // True only for a CRC-validated frame recovered by the optional pilot path.
+  bool tracking_used = false;
+  // This new CRC result was obtained on the optional tracked-cancellation residual.
+  bool after_tracked_sic = false;
 };
 
 // Summary emitted after a decode pass.
 struct DecodeFinished {
   std::size_t decoded = 0;
+  // Committed tracked cancellations across the active submodes (at most two each).
+  std::size_t tracked_cancellations = 0;
+  bool optional_work_skipped = false;
+  bool canceled = false;
 };
 
 // A UI-oriented spectrum snapshot.
@@ -87,6 +95,12 @@ struct EngineConfig {
   int tx_output_rate_hz = 48000;
   float tx_output_gain = 1.0f;
   bool tx_output_gain_boost_enabled = false;
+  SymbolTracking symbol_tracking = SymbolTracking::Both;
+  // Guarded cancellation is enabled by default; inert unless tracking is Both.
+  bool tracked_sic = true;
+  // Monotonic wall-time allowance from enqueue through optional work. Zero
+  // disables optional work; mandatory decoding is not subject to this budget.
+  int optional_decode_budget_ms = 250;
 };
 
 // Request to encode and transmit a user message.
@@ -112,6 +126,8 @@ struct TxFrameRequest {
 };
 
 struct EngineCallbacks {
+  // Worker-thread callbacks must remain nonblocking. Event delivery is serial;
+  // queue slow application work elsewhere rather than blocking capture/decode.
   std::function<void(events::Variant const&)> on_event;
   std::function<void(std::string_view message)> on_error;
   std::function<void(LogLevel level, std::string_view message)> on_log;

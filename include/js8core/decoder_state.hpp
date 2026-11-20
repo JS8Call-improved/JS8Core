@@ -4,6 +4,8 @@
 #include <mutex>
 #include <vector>
 
+#include "js8core/types.hpp"
+
 namespace js8core {
 
 // Core decoder constants mirrored from legacy commons.h
@@ -32,6 +34,9 @@ struct DecodeParams {
   int kszE = 0;
   int kszI = 0;
   int nsubmodes = 0;
+  SymbolTracking symbol_tracking = SymbolTracking::Both;
+  // Enabled by default; requires Both tracking and two valid fitted components.
+  bool tracked_sic = true;
 };
 
 struct DecodeState {

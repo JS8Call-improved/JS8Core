@@ -1,5 +1,19 @@
 cmake_minimum_required(VERSION 3.20)
-project(js8core VERSION 0.1.0 LANGUAGES CXX)
+
+# Read the public header so library and package versions share one source.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/include/js8core/version.hpp")
+foreach(component MAJOR MINOR PATCH)
+  file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/js8core/version.hpp"
+    version_line REGEX "^#define JS8CORE_VERSION_${component} [0-9]+$")
+  if(NOT version_line MATCHES "^#define JS8CORE_VERSION_${component} ([0-9]+)$")
+    message(FATAL_ERROR "Missing or invalid JS8CORE_VERSION_${component} in version.hpp")
+  endif()
+  set(JS8CORE_VERSION_${component} "${CMAKE_MATCH_1}")
+endforeach()
+project(js8core
+  VERSION ${JS8CORE_VERSION_MAJOR}.${JS8CORE_VERSION_MINOR}.${JS8CORE_VERSION_PATCH}
+  LANGUAGES CXX)
 
 # js8core — independent JS8 modem library.
 # On-air protocol tables are retained at their canonical bit/index values.
@@ -17,10 +31,13 @@ include(CMakePackageConfigHelpers)
 find_package(Threads REQUIRED)
 
 add_library(js8core STATIC
+  src/version.cpp
   src/placeholder.cpp
   src/engine/engine.cpp
   src/decoder/legacy_decoder.cpp
   src/decoder/ldpc.cpp
+  src/decoder/symbol_tracking.cpp
+  src/decoder/tracked_reference.cpp
   src/dsp/flatten.cpp
   src/dsp/resampler.cpp
   src/tx/modulator.cpp
@@ -82,6 +99,12 @@ endif()
 # A minimal standard-CRC shim is vendored under vendor/CRCpp/ for in-tree builds.
 
 # Test tools (EXCLUDE_FROM_ALL): build manually when needed.
+add_executable(js8core-version-test EXCLUDE_FROM_ALL tools/version_test.cpp)
+target_link_libraries(js8core-version-test PRIVATE js8core)
+if(BUILD_TESTING)
+  add_test(NAME js8core-version COMMAND js8core-version-test)
+endif()
+
 if(JS8CORE_WITH_VARI)
   add_executable(js8core-varicode-test EXCLUDE_FROM_ALL
     tools/varicode_roundtrip.cpp
@@ -132,6 +155,40 @@ target_compile_features(js8core-decoder-roundtrip-test PRIVATE cxx_std_20)
 target_include_directories(js8core-decoder-roundtrip-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(js8core-decoder-roundtrip-test PRIVATE js8core)
 
+add_executable(js8core-tracking-waveform-test EXCLUDE_FROM_ALL
+  tools/tracking_waveform_test.cpp
+)
+target_compile_features(js8core-tracking-waveform-test PRIVATE cxx_std_20)
+
+add_executable(js8core-symbol-tracking-test EXCLUDE_FROM_ALL
+  tools/symbol_tracking_test.cpp
+)
+target_include_directories(js8core-symbol-tracking-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(js8core-symbol-tracking-test PRIVATE js8core)
+
+add_executable(js8core-tracked-extraction-test EXCLUDE_FROM_ALL
+  tools/tracked_extraction_test.cpp
+)
+target_include_directories(js8core-tracked-extraction-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(js8core-tracked-extraction-test PRIVATE js8core)
+
+add_executable(js8core-tracked-reference-test EXCLUDE_FROM_ALL
+  tools/tracked_reference_test.cpp
+)
+target_include_directories(js8core-tracked-reference-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(js8core-tracked-reference-test PRIVATE js8core)
+
+add_executable(js8core-engine-tracking-test EXCLUDE_FROM_ALL tools/engine_tracking_test.cpp)
+target_link_libraries(js8core-engine-tracking-test PRIVATE js8core)
+add_executable(js8core-decode-control-test EXCLUDE_FROM_ALL tools/decode_control_test.cpp)
+target_include_directories(js8core-decode-control-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(js8core-decode-control-test PRIVATE js8core)
+
+add_executable(js8core-tracking-baseline EXCLUDE_FROM_ALL
+  tools/tracking_baseline.cpp
+)
+target_link_libraries(js8core-tracking-baseline PRIVATE js8core)
+
 if(BUILD_TESTING)
   add_test(NAME js8core-fractional-rx COMMAND js8core-fractional-rx-test)
   add_test(NAME js8core-crc COMMAND js8core-crc-test)
@@ -141,6 +198,36 @@ if(BUILD_TESTING)
   add_test(NAME js8core-vox COMMAND js8core-vox-test)
   add_test(NAME js8core-clock-math COMMAND js8core-clock-math-test)
   add_test(NAME js8core-decoder-roundtrip COMMAND js8core-decoder-roundtrip-test)
+  add_test(NAME js8core-tracking-waveform COMMAND js8core-tracking-waveform-test)
+  add_test(NAME js8core-symbol-tracking COMMAND js8core-symbol-tracking-test)
+  add_test(NAME js8core-tracked-extraction COMMAND js8core-tracked-extraction-test)
+  add_test(NAME js8core-tracked-reference COMMAND js8core-tracked-reference-test)
+  add_test(NAME js8core-tracking-baseline COMMAND js8core-tracking-baseline)
+  add_test(NAME js8core-tracking-enabled COMMAND js8core-tracking-baseline --tracking both)
+  add_test(NAME js8core-tracking-recovery COMMAND js8core-tracking-baseline
+    --tracking both --sweep 3 --case tracking-drift --require-tracked)
+  add_test(NAME js8core-tracking-negative COMMAND js8core-tracking-baseline
+    --tracking both --sweep 3 --case single-tone)
+  add_test(NAME js8core-tracking-wrap COMMAND js8core-tracking-baseline
+    --tracking both --sweep 3 --case tracking-drift --require-tracked --wrap)
+  add_test(NAME js8core-tracked-sic COMMAND js8core-tracking-baseline
+    --tracking both --tracked-sic --sweep 3 --case tracking-drift --require-cancellation)
+  add_test(NAME js8core-tracked-sic-followup COMMAND js8core-tracking-baseline
+    --tracking both --tracked-sic --sweep 8 --mode I --case tracking-overlap --require-followup)
+  add_test(NAME js8core-tracked-sic-wrap COMMAND js8core-tracking-baseline
+    --tracking both --tracked-sic --sweep 8 --mode I --case tracking-overlap --require-followup --wrap)
+  add_test(NAME js8core-tracked-sic-inert COMMAND js8core-tracking-baseline
+    --tracking frequency --tracked-sic --sweep 3 --case tracking-drift --require-tracked)
+  add_test(NAME js8core-tracking-defaults COMMAND js8core-tracking-baseline
+    --library-defaults --sweep 8 --mode I --case tracking-overlap --require-followup)
+  add_test(NAME js8core-engine-tracking COMMAND js8core-engine-tracking-test)
+  add_test(NAME js8core-decode-control COMMAND js8core-decode-control-test)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME js8core-wav-tracking-tool
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/wav_tracking_test.py
+        $<TARGET_FILE:js8core-wav-decode-test> --work-dir ${CMAKE_CURRENT_BINARY_DIR})
+  endif()
   add_test(NAME js8core-engine-smoke COMMAND js8core-engine-smoke-test)
 endif()
 

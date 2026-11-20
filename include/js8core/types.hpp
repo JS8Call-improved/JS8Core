@@ -17,6 +17,10 @@ using FrequencyDeltaHz = std::int64_t;
 
 enum class SampleType { Int16, Float32 };
 
+// Pilot-anchored receive fallback (Both is the configuration default). Disabled
+// preserves the legacy path; tracking follows its complete SIC sequence.
+enum class SymbolTracking { Disabled, Frequency, Timing, Both };
+
 struct AudioFormat {
   int sample_rate = 0;
   int channels = 0;

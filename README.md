@@ -93,6 +93,27 @@ power presentation have their own internal policy specification in
 `src/protocol/varicode_policy.hpp`. Its compatibility decisions are
 tested independently of the wire tables.
 
+## Library version
+
+The library version is declared in `include/js8core/version.hpp`. Update its
+`JS8CORE_VERSION_MAJOR`, `JS8CORE_VERSION_MINOR`, and `JS8CORE_VERSION_PATCH`
+definitions to bump the version. CMake reads those values for package versioning,
+and the version string is derived from them:
+
+```cpp
+#include <js8core/version.hpp>
+#include <iostream>
+
+std::cout << "JS8Core " << js8core::version() << '\n';
+```
+
+`js8core::version()` returns a `std::string_view` identifying the linked library,
+without requiring an engine instance. `JS8CORE_VERSION_STRING` and the numeric
+`JS8CORE_VERSION_MAJOR`, `JS8CORE_VERSION_MINOR`, and `JS8CORE_VERSION_PATCH`
+macros identify the headers used at compile time. These describe the library
+release, not the JS8 on-air protocol version. The header is available through
+the `js8core::js8core` target in both in-tree and installed builds.
+
 ## Verification
 
 Two focused checks are provided in `tools/`:
@@ -166,6 +187,37 @@ a sibling host project's `vendor/` directory.
 
 Run `js8core-android-compat-test` alongside the native regressions to check
 external PTT, offline status callbacks, and accelerated audio submission.
+
+## Experimental symbol tracking
+
+Per-symbol frequency and timing corrections are enabled by default as a receive
+fallback via `EngineConfig::symbol_tracking` (`SymbolTracking::Frequency`,
+`Timing`, or `Both`; the default is `Both`). The established decoder runs
+first. Additional CRC-validated results have `events::Decoded::tracking_used`
+set to true and are not used for fixed-waveform interference cancellation.
+
+`EngineConfig::tracked_sic` enables guarded trajectory-aware cancellation when
+tracking is `Both`. It defaults to true and requires complete
+frequency/timing fits, CRC validation and a guarded energy-reducing residual.
+New results from that residual have `Decoded::after_tracked_sic` set to true.
+
+Optional receive work yields to queued captures and a monotonic deadline set by
+`EngineConfig::optional_decode_budget_ms` (250 ms by default). Zero disables
+optional work without disabling mandatory decoding. Stale capture epochs and
+overwritten windows are canceled rather than delivered into a newer RX context.
+
+See [symbol-tracking validation](docs/symbol-tracking-validation.md) for the
+independent mathematical model, controls, tests, development measurements and
+remaining validation limits. These defaults also apply to direct `DecodeParams`
+users. To restore the original decoder, explicitly configure:
+
+```cpp
+config.symbol_tracking = js8core::SymbolTracking::Disabled;
+config.tracked_sic = false;
+```
+
+Default enablement does not imply RF validation; the recorded-HF and load-testing
+limits in the validation document still apply.
 
 ## Building and testing the independent package
 
