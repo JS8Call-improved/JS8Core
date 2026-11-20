@@ -1,5 +1,19 @@
 cmake_minimum_required(VERSION 3.20)
-project(js8core VERSION 0.1.0 LANGUAGES CXX)
+
+# Read the public header so library and package versions share one source.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/include/js8core/version.hpp")
+foreach(component MAJOR MINOR PATCH)
+  file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/js8core/version.hpp"
+    version_line REGEX "^#define JS8CORE_VERSION_${component} [0-9]+$")
+  if(NOT version_line MATCHES "^#define JS8CORE_VERSION_${component} ([0-9]+)$")
+    message(FATAL_ERROR "Missing or invalid JS8CORE_VERSION_${component} in version.hpp")
+  endif()
+  set(JS8CORE_VERSION_${component} "${CMAKE_MATCH_1}")
+endforeach()
+project(js8core
+  VERSION ${JS8CORE_VERSION_MAJOR}.${JS8CORE_VERSION_MINOR}.${JS8CORE_VERSION_PATCH}
+  LANGUAGES CXX)
 
 # js8core — independent JS8 modem library.
 # On-air protocol tables are retained at their canonical bit/index values.
@@ -17,6 +31,7 @@ include(CMakePackageConfigHelpers)
 find_package(Threads REQUIRED)
 
 add_library(js8core STATIC
+  src/version.cpp
   src/placeholder.cpp
   src/engine/engine.cpp
   src/decoder/legacy_decoder.cpp
@@ -84,6 +99,12 @@ endif()
 # A minimal standard-CRC shim is vendored under vendor/CRCpp/ for in-tree builds.
 
 # Test tools (EXCLUDE_FROM_ALL): build manually when needed.
+add_executable(js8core-version-test EXCLUDE_FROM_ALL tools/version_test.cpp)
+target_link_libraries(js8core-version-test PRIVATE js8core)
+if(BUILD_TESTING)
+  add_test(NAME js8core-version COMMAND js8core-version-test)
+endif()
+
 if(JS8CORE_WITH_VARI)
   add_executable(js8core-varicode-test EXCLUDE_FROM_ALL
     tools/varicode_roundtrip.cpp

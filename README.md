@@ -93,6 +93,27 @@ power presentation have their own internal policy specification in
 `src/protocol/varicode_policy.hpp`. Its compatibility decisions are
 tested independently of the wire tables.
 
+## Library version
+
+The library version is declared in `include/js8core/version.hpp`. Update its
+`JS8CORE_VERSION_MAJOR`, `JS8CORE_VERSION_MINOR`, and `JS8CORE_VERSION_PATCH`
+definitions to bump the version. CMake reads those values for package versioning,
+and the version string is derived from them:
+
+```cpp
+#include <js8core/version.hpp>
+#include <iostream>
+
+std::cout << "JS8Core " << js8core::version() << '\n';
+```
+
+`js8core::version()` returns a `std::string_view` identifying the linked library,
+without requiring an engine instance. `JS8CORE_VERSION_STRING` and the numeric
+`JS8CORE_VERSION_MAJOR`, `JS8CORE_VERSION_MINOR`, and `JS8CORE_VERSION_PATCH`
+macros identify the headers used at compile time. These describe the library
+release, not the JS8 on-air protocol version. The header is available through
+the `js8core::js8core` target in both in-tree and installed builds.
+
 ## Verification
 
 Two focused checks are provided in `tools/`:

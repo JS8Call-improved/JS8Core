@@ -28,7 +28,7 @@ jobs:
       - name: Build
         run: >
           cmake --build build --parallel 2 --target
-          js8core js8core-crc-test js8core-varicode-test js8core-policy-test js8core-clock-math-test
+          js8core js8core-version-test js8core-crc-test js8core-varicode-test js8core-policy-test js8core-clock-math-test
           verify_jsc_roundtrip js8core-vox-test js8core-fractional-rx-test
           js8core-tracking-waveform-test js8core-tracking-baseline
           js8core-symbol-tracking-test
