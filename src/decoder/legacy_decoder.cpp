@@ -49,6 +49,22 @@ constexpr std::ptrdiff_t kComplexStride =
 constexpr std::ptrdiff_t kFloatStride = static_cast<std::ptrdiff_t>(sizeof(float));
 constexpr std::complex<float> kZero{0.0f, 0.0f};
 
+// Frame read length. The channel holds ds_fft_out samples, but the decoder
+// read only payload_samples (79 symbols) counted from the start of the period.
+// A frame starts start_seconds plus its time offset into the period, so its
+// last symbols read as silence: at Normal speed and a 0.3 s offset, 5 of the
+// 21 sync tones; above about 0.62 s, data tones too. WSJT-X FT8 (ft8b,
+// sync8d) and JS8Call-improved v3.0.3 read to 2,812 samples, capped here at
+// the channel length. Normal, Fast and Turbo only: at Slow the longer read
+// gained 0.7% messages for 15% to 20% more CRC-check chances, so Slow and
+// mode I keep the old length.
+constexpr int kFrameReadSamples = 2812;
+template <typename Mode>
+inline constexpr int kReadSamples =
+    (Mode::event_mode == 0 || Mode::event_mode == 1 || Mode::event_mode == 2)
+        ? (kFrameReadSamples < Mode::ds_fft_out ? kFrameReadSamples : Mode::ds_fft_out)
+        : Mode::payload_samples;
+
 // Kahan-compensated accumulator. The Nuttall window is very sensitive to
 // summation order; plain float accumulation shifts the coefficients enough to
 // matter during correlation.
@@ -437,7 +453,7 @@ float ChannelDecoder<Mode>::alignment_score(int offset, float frequency_delta) {
     for (int column = 0; column < 7; ++column) {
       int const start =
           36 * block * Mode::downsample_sps + offset + column * Mode::downsample_sps;
-      if (start < 0 || start + Mode::downsample_sps > Mode::payload_samples) {
+      if (start < 0 || start + Mode::downsample_sps > kReadSamples<Mode>) {
         continue;
       }
 
@@ -552,8 +568,15 @@ std::vector<Candidate> ChannelDecoder<Mode>::find_candidates(int low_hz,
       }
     }
 
-    entries.push_back(Candidate{Mode::bin_hz * bin,
-                                Mode::step_seconds * (best_offset + 0.5f), best});
+    // The spectra fill the whole 2-symbol FFT span with audio under a window
+    // that peaks one symbol in, so a tone scores best when the spectrum
+    // starts 2 steps (half a symbol) before it. Counting from the true step
+    // (start_step plus those 2) keeps the candidate time on the signal's
+    // start instead of 1.5 steps early.
+    entries.push_back(Candidate{
+        Mode::bin_hz * bin,
+        (best_offset + Mode::start_step + 2) * Mode::step_seconds - Mode::start_seconds,
+        best});
   }
 
   if (entries.empty()) return {};
@@ -636,7 +659,7 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
     }
   }
 
-  float const refined_offset = best_time * down_period;
+  float refined_offset = best_time * down_period;
   origin = static_cast<int>(std::round(refined_offset * down_rate));
   best_score = 0.0f;
   float best_delta = 0.0f;
@@ -650,10 +673,26 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
     }
   }
 
+  // Time again at the corrected frequency, over half the first window (as
+  // WSJT-X does in ft8b).
+  float best_retime = 0.0f;
+  int retime = origin;
+  for (int candidate = origin - Mode::quarter_symbol / 2;
+       candidate <= origin + Mode::quarter_symbol / 2; ++candidate) {
+    float const score = alignment_score(candidate, best_delta);
+    if (score > best_retime) {
+      best_retime = score;
+      retime = candidate;
+    }
+  }
+  best_time = retime;
+  refined_offset = best_time * down_period;
+  origin = static_cast<int>(std::round(refined_offset * down_rate));
+
   float const phase_step = -best_delta * (kTau / down_rate);
   std::complex<float> const rotation_step = std::polar(1.0f, phase_step);
   std::complex<float> rotation{1.0f, 0.0f};
-  for (int i = 0; i < Mode::payload_samples; ++i) {
+  for (int i = 0; i < kReadSamples<Mode>; ++i) {
     rotation *= rotation_step;
     channel_[static_cast<std::size_t>(i)] *= rotation;
   }
@@ -706,7 +745,7 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
     if (!tracked_symbols.empty()) {
       auto const first = tracked_symbols.begin() + symbol * Mode::downsample_sps;
       std::copy_n(first, Mode::downsample_sps, symbol_fft_.begin());
-    } else if (start >= 0 && start + Mode::downsample_sps <= Mode::payload_samples) {
+    } else if (start >= 0 && start + Mode::downsample_sps <= kReadSamples<Mode>) {
       std::copy(channel_.begin() + start,
                 channel_.begin() + start + Mode::downsample_sps,
                 symbol_fft_.begin());
