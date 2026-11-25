@@ -636,7 +636,7 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
     }
   }
 
-  float const refined_offset = best_time * down_period;
+  float refined_offset = best_time * down_period;
   origin = static_cast<int>(std::round(refined_offset * down_rate));
   best_score = 0.0f;
   float best_delta = 0.0f;
@@ -649,6 +649,22 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
       best_delta = delta;
     }
   }
+
+  // Time again at the corrected frequency, over half the first window (as
+  // WSJT-X does in ft8b).
+  float best_retime = 0.0f;
+  int retime = origin;
+  for (int candidate = origin - Mode::quarter_symbol / 2;
+       candidate <= origin + Mode::quarter_symbol / 2; ++candidate) {
+    float const score = alignment_score(candidate, best_delta);
+    if (score > best_retime) {
+      best_retime = score;
+      retime = candidate;
+    }
+  }
+  best_time = retime;
+  refined_offset = best_time * down_period;
+  origin = static_cast<int>(std::round(refined_offset * down_rate));
 
   float const phase_step = -best_delta * (kTau / down_rate);
   std::complex<float> const rotation_step = std::polar(1.0f, phase_step);
