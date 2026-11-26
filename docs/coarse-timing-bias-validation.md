@@ -1,24 +1,35 @@
 # Coarse timing bias correction: validation
 
 One change in `src/decoder/legacy_decoder.cpp`, in `find_candidates`: the
-start time given to each candidate. The waveform, the fine timing and
-frequency search, the LDPC decoding and the CRC acceptance rule are
-unchanged.
+start time given to each candidate. This shifts the center of the fine timing
+search without widening it. The waveform, frequency search, LDPC decoding,
+and CRC acceptance rule are unchanged.
 
 The candidate spectra fill the whole 2-symbol FFT span under a window that
 peaks one symbol in, so a tone scores best when the spectrum starts 2 coarse
-steps (half a symbol) before it. Candidate times were taken from the window
-start plus half a step, so they came out 1.5 coarse steps early:
+steps (half a symbol) before it. The new estimate uses the actual window
+start plus two steps. The old estimate used the nominal start plus the
+winning offset and half a step:
 
-| Speed | Bias removed |
+```text
+old: start_seconds + (best_offset + 0.5) * step_seconds
+new: (start_step + best_offset + 2) * step_seconds
+```
+
+`start_step` rounds the nominal start down to a whole coarse step, so the
+net shift is 1.5 steps minus that rounding remainder. These are shifts in
+the coarse estimate before fine-search sample rounding, not measured errors
+in decoded timestamps.
+
+| Speed | Shift in coarse estimate |
 |---|---:|
-| Normal | -0.043 s |
-| Fast | -0.039 s |
-| Turbo | -0.020 s |
-| Slow | -0.107 s |
+| Normal (A) | +40 ms |
+| Fast (B) | +37.5 ms |
+| Turbo (C) | +18.75 ms |
+| Slow (E) | +100 ms |
+| Mode I | +8 ms |
 
-The candidate time now counts from the true step:
-`(best_offset + start_step + 2) * step_seconds - start_seconds`.
+Mode I shares the code change but was not part of the 48-set benchmark.
 
 This was split out of pull request #6, without that pull request's change to
 the frame read length.
@@ -28,9 +39,9 @@ the frame read length.
 48 sets of computer-made JS8 audio. One list of 700 messages (100 each of
 heartbeat, CQ, contact reply, directed short text, relay, ragchew and weather
 report, from 40 stations) is built into frames by JS8Core's
-`build_message_frames` and sent at all four speeds and 8 levels (-6 to -27 dB
-in 3 dB steps). A message of several frames goes out in consecutive cycles at
-one frequency and start time, like a station sending it.
+`build_message_frames` and sent at four speeds (A, B, C, E) and 8 levels
+(-6 to -27 dB in 3 dB steps). A message of several frames goes out in
+consecutive cycles at one frequency and start time, like a station sending it.
 
 - Kinds: no fading, 4 stations per file; ITU mid-latitude disturbed fading
   (1 Hz spread, 2 ms delay), 4 stations per file; crowded band (60 stations

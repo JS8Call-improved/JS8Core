@@ -630,9 +630,9 @@ std::vector<Candidate> ChannelDecoder<Mode>::find_candidates(int low_hz,
 
     // The spectra fill the whole 2-symbol FFT span with audio under a window
     // that peaks one symbol in, so a tone scores best when the spectrum
-    // starts 2 steps (half a symbol) before it. Counting from the true step
-    // (start_step plus those 2) keeps the candidate time on the signal's
-    // start instead of 1.5 steps early.
+    // starts 2 steps (half a symbol) before it. Use the actual window start
+    // (start_step + best_offset), then advance 2 steps to estimate the
+    // signal start. start_step rounds down from the nominal start time.
     entries.push_back(Candidate{
         Mode::bin_hz * bin,
         (best_offset + Mode::start_step + 2) * Mode::step_seconds - Mode::start_seconds,

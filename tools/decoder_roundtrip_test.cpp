@@ -3,8 +3,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <random>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -68,8 +68,9 @@ std::vector<std::int16_t> synthesize(std::array<int, kSymbols> const& tones,
   return samples;
 }
 
-bool decode_once(std::vector<std::int16_t> const& samples, ModeCase const& mode,
-                 double base_hz, std::string& text, int& type) {
+std::optional<events::Decoded> decode_once(
+    std::vector<std::int16_t> const& samples, ModeCase const& mode, double base_hz,
+    SymbolTracking tracking = DecodeParams{}.symbol_tracking) {
   DecodeState state;
   state.samples = samples;
   state.params.utc = 0;
@@ -78,6 +79,7 @@ bool decode_once(std::vector<std::int16_t> const& samples, ModeCase const& mode,
   state.params.nfb = static_cast<int>(base_hz) + 100;
   state.params.nsubmodes = 1 << mode.bit;
   state.params.syncStats = false;
+  state.params.symbol_tracking = tracking;
 
   if (mode.bit == 0) { state.params.kposA = 0; state.params.kszA = mode.tx_seconds * kRate; }
   if (mode.bit == 1) { state.params.kposB = 0; state.params.kszB = mode.tx_seconds * kRate; }
@@ -85,17 +87,13 @@ bool decode_once(std::vector<std::int16_t> const& samples, ModeCase const& mode,
   if (mode.bit == 3) { state.params.kposE = 0; state.params.kszE = mode.tx_seconds * kRate; }
   if (mode.bit == 4) { state.params.kposI = 0; state.params.kszI = mode.tx_seconds * kRate; }
 
-  bool found = false;
+  std::optional<events::Decoded> first;
   legacy_decode(state, [&](events::Variant const& ev) {
     if (auto const* decoded = std::get_if<events::Decoded>(&ev)) {
-      if (!found) {
-        text = decoded->data;
-        type = decoded->type;
-        found = true;
-      }
+      if (!first) first = *decoded;
     }
   });
-  return found;
+  return first;
 }
 
 }  // namespace
@@ -170,9 +168,10 @@ int main() {
     }
   }
 
+  constexpr ModeCase fast{'B', 1200, 10, 0.2, 1, protocol::CostasType::Modified};
   const std::array<ModeCase, 5> modes = {{
       {'A', 1920, 15, 0.5, 0, protocol::CostasType::Original},
-      {'B', 1200, 10, 0.2, 1, protocol::CostasType::Modified},
+      fast,
       {'C', 600, 6, 0.1, 2, protocol::CostasType::Modified},
       {'E', 3840, 30, 0.5, 3, protocol::CostasType::Modified},
       {'I', 384, 4, 0.1, 4, protocol::CostasType::Modified},
@@ -204,22 +203,46 @@ int main() {
           const double start = mode.start_s + 0.013;
           auto samples = synthesize(tones, mode, frequency, 5000.0, start,
                                     noise, 0x1234u + cases);
-          std::string text;
-          int type = -1;
           ++cases;
-          if (!decode_once(samples, mode, frequency, text, type)) {
+          auto const decoded = decode_once(samples, mode, frequency);
+          if (!decoded) {
             std::printf("FAIL mode %c freq %.0f noise %.0f msg '%s': no decode\n",
                         mode.name, frequency, noise, message.text);
             ++failures;
             continue;
           }
-          if (text != message.text || type != message.type) {
+          if (decoded->data != message.text || decoded->type != message.type) {
             std::printf("FAIL mode %c freq %.0f noise %.0f: got '%s' type %d\n",
-                        mode.name, frequency, noise, text.c_str(), type);
+                        mode.name, frequency, noise, decoded->data.c_str(), decoded->type);
             ++failures;
           }
         }
       }
+    }
+  }
+
+  {
+    // The old coarse estimate left the true start outside the fine search.
+    // This frame can still pass CRC at the wrong time, so check xdt as well.
+    constexpr double frequency = 1500.0;
+    constexpr double expected_xdt = 0.0125;
+    constexpr double tolerance = 0.005;  // One Fast-mode fine-search sample.
+    auto const& message = messages.front();
+    std::array<int, kSymbols> tones{};
+    legacy_encode(message.type, protocol::costas(fast.costas),
+                  message.text, tones.data());
+    auto const samples = synthesize(tones, fast, frequency, 5000.0,
+                                    fast.start_s + expected_xdt, 0.0, 0);
+    auto const decoded = decode_once(samples, fast, frequency, SymbolTracking::Disabled);
+    ++cases;
+    if (!decoded || decoded->data != message.text || decoded->type != message.type) {
+      std::printf("FAIL Fast coarse timing: expected '%s' type %d\n",
+                  message.text, message.type);
+      ++failures;
+    } else if (!(std::abs(decoded->xdt - expected_xdt) <= tolerance)) {
+      std::printf("FAIL Fast coarse timing: xdt %.3f ms, expected %.3f +/- %.3f ms\n",
+                  1000.0 * decoded->xdt, 1000.0 * expected_xdt, 1000.0 * tolerance);
+      ++failures;
     }
   }
 
