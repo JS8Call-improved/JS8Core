@@ -1,10 +1,12 @@
 # Noncoherent soft symbol likelihoods
 
-JS8Core uses noncoherent soft symbol likelihoods by default in **ordinary
-pass 2**, without adding a BP attempt. Pass 1, the erasure and rescue passes,
-tracked demodulation, and OSD's input and acceptance rules are unchanged. If
-the soft metric cannot be formed, pass 2 falls back to the logarithmic metric.
-The logarithmic metric is only calculated when pass 2 uses it. Build with
+These notes describe the noncoherent soft demapper used first in **ordinary
+pass 2**. Coherent data likelihoods are an optional retry after that attempt
+fails the decode checks.
+Pass 1, the erasure and rescue passes, tracked demodulation, and OSD's input
+and acceptance rules are unchanged by this demapper. If the soft metric
+cannot be formed, pass 2 falls back to the logarithmic metric. The logarithmic
+metric is only calculated when pass 2 uses it. Build with
 `-DJS8CORE_SOFT_DEMAPPER=OFF` to use that metric for comparison.
 
 ## Model

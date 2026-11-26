@@ -28,12 +28,12 @@
 
 #include "coherent_costas.hpp"
 #include "decode_quality.hpp"
-#include "soft_likelihoods.hpp"
 #include "decoder_tables.hpp"
 #include "frame_history.hpp"
 #include "ldpc.hpp"
 #if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
 #include "soft_likelihood.hpp"
+#include "soft_likelihoods.hpp"
 #endif
 #include "symbol_tracking.hpp"
 #include "tracked_reference.hpp"
@@ -666,7 +666,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
     int& hard_errors, float& snr, int& rescue_budget, EventEmitter emit,
     SymbolTracking tracking, int received_samples,
     std::optional<decoder::TrackedTrajectory>* trajectory, DecodeControl const* control,
-    decoder::CoherentCostasPeak const* deep, bool coherent_likelihood)
+    decoder::CoherentCostasPeak const* deep, [[maybe_unused]] bool coherent_likelihood)
     -> std::optional<AttemptResult> {
   if (trajectory) trajectory->reset();
   auto allowed = [&] {
@@ -732,14 +732,30 @@ auto ChannelDecoder<Mode>::attempt_decode(
   }
   float const refined_offset = best_time * down_period;
   int const origin = static_cast<int>(std::round(refined_offset * down_rate));
-  int const demodulation_limit = deep
-      ? std::min(Mode::ds_fft_out, received_samples / Mode::downsample_factor)
-      : Mode::payload_samples;
+  int const received_limit = std::min(Mode::ds_fft_out, received_samples / Mode::downsample_factor);
+  int const demodulation_limit = deep ? received_limit : Mode::payload_samples;
+  int rotation_limit = demodulation_limit;
+#if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
+  // The ordinary demodulator stops at a fixed buffer index. A frame starting
+  // later can still have a complete final Costas block in the received audio.
+  // Extend pilot observations only; recovering data beyond the ordinary
+  // demodulation window is left to deep sync or symbol tracking.
+  constexpr int last_data_end = (kChannelSymbols - kSyncSymbols / 3) * Mode::downsample_sps;
+  std::optional<decoder::ToneObservations> observations;
+  if (coherent_likelihood && (!control || control->allow_optional()) &&
+      (tracking != SymbolTracking::Disabled ||
+       (best_time >= 0 && best_time + last_data_end <= demodulation_limit &&
+        best_time + Mode::payload_samples <= received_limit))) {
+    observations.emplace();
+    if (tracking == SymbolTracking::Disabled)
+      rotation_limit = std::max(rotation_limit, best_time + Mode::payload_samples);
+  }
+#endif
 
   float const phase_step = -best_delta * (kTau / down_rate);
   std::complex<float> const rotation_step = std::polar(1.0f, phase_step);
   std::complex<float> rotation{1.0f, 0.0f};
-  for (int i = 0; i < demodulation_limit; ++i) {
+  for (int i = 0; i < rotation_limit; ++i) {
     rotation *= rotation_step;
     channel_[static_cast<std::size_t>(i)] *= rotation;
   }
@@ -749,8 +765,6 @@ auto ChannelDecoder<Mode>::attempt_decode(
   float const sync = alignment_score(origin, 0.0f, demodulation_limit);
 
   std::array<std::array<float, kChannelSymbols>, kToneRows> tone_power{};
-  // Coherent data-likelihood observations (filled only when enabled).
-  decoder::ToneObservations observations;
 
   std::vector<std::complex<float>> tracked_symbols;
   std::optional<decoder::TrackedTrajectory> fitted_trajectory;
@@ -790,11 +804,17 @@ auto ChannelDecoder<Mode>::attempt_decode(
   for (int symbol = 0; symbol < kChannelSymbols; ++symbol) {
     if (!allowed()) return std::nullopt;
     int const start = best_time + symbol * Mode::downsample_sps;
-    symbol_fft_.fill(kZero);
+    bool const legacy_symbol = !tracked_symbols.empty() ||
+        (start >= 0 && start + Mode::downsample_sps <= demodulation_limit);
+    bool demodulate = legacy_symbol;
+#if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
+    demodulate |= observations.has_value();
+#endif
+    if (!demodulate) continue;
     if (!tracked_symbols.empty()) {
       auto const first = tracked_symbols.begin() + symbol * Mode::downsample_sps;
       std::copy_n(first, Mode::downsample_sps, symbol_fft_.begin());
-    } else if (start >= 0 && start + Mode::downsample_sps <= demodulation_limit) {
+    } else {
       std::copy(channel_.begin() + start,
                 channel_.begin() + start + Mode::downsample_sps,
                 symbol_fft_.begin());
@@ -805,11 +825,13 @@ auto ChannelDecoder<Mode>::attempt_decode(
                           shape_t{0}, true, symbol_fft_.data(),
                           symbol_fft_.data(), 1.0f, 1);
 
-    if (coherent_likelihood) {
-      for (int row = 0; row < kToneRows; ++row)
-        observations[static_cast<std::size_t>(symbol)][static_cast<std::size_t>(row)] =
-            symbol_fft_[static_cast<std::size_t>(row)];
+#if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
+    if (observations) {
+      auto& bins = (*observations)[static_cast<std::size_t>(symbol)];
+      std::copy_n(symbol_fft_.begin(), kToneRows, bins.begin());
     }
+#endif
+    if (!legacy_symbol) continue;
     for (int row = 0; row < kToneRows; ++row) {
       tone_power[static_cast<std::size_t>(row)][static_cast<std::size_t>(symbol)] =
           std::abs(symbol_fft_[static_cast<std::size_t>(row)]) / 1000.0f;
@@ -899,21 +921,8 @@ auto ChannelDecoder<Mode>::attempt_decode(
 
   auto pass_two_llrs = [&] {
 #if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
-    if (coherent_likelihood) {
-      // Coherent data-likelihood soft symbols: per-tone noise, bounded pilot
-      // channel fit, then Rician fallback when the fit fails. Uses the captured
-      // per-symbol complex bins and produces LLRs in code-bit order.
-      if (auto model = decoder::estimate_disturbance(observations, kCostas, true, control)) {
-        if (auto channel = decoder::estimate_pilot_channel(observations, kCostas, *model, control)) {
-          if (auto coherent = decoder::make_soft_likelihoods(observations, *model, &*channel, control))
-            return *coherent;
-        } else if (auto soft = decoder::make_soft_likelihoods(observations, *model, nullptr, control)) {
-          return *soft;
-        }
-      }
-    }
     if (tracking == SymbolTracking::Disabled) {
-      int const available = std::min(demodulation_limit, received_samples / Mode::downsample_factor);
+      int const available = std::min(demodulation_limit, received_limit);
       if (auto soft = decoder::soft_frame_llrs(tone_power, kCostas, best_time,
                                                Mode::downsample_sps, available))
         return *soft;
@@ -926,7 +935,18 @@ auto ChannelDecoder<Mode>::attempt_decode(
   std::array<std::int8_t, kPayloadBits> payload{};
   std::array<std::int8_t, kCodeLength> codeword{};
 
-  auto osd_allowed = [&] { return !control || control->allow_optional(); };
+  auto optional_allowed = [&] { return !control || control->allow_optional(); };
+  auto accepts_codeword = [&](int pass) {
+    if (std::all_of(codeword.begin(), codeword.end(),
+                    [](std::int8_t bit) { return bit == 0; }))
+      return false;
+    // OSD's weighted discrepancy limits do not replace the hard-error limits.
+    if (!decoder::hard_errors_acceptable(pass, hard_errors, sync)) {
+      hard_errors = -1;
+      return false;
+    }
+    return decoder::crc_ok(payload);
+  };
   for (int pass = 1; pass <= (deep ? 4 : 6); ++pass) {
     if (!allowed()) return std::nullopt;
     std::array<float, 3 * kDataSymbols> rescue_llr{};
@@ -936,7 +956,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
       if (tracking != SymbolTracking::Disabled || sync_matches < kOsdMinSyncMatches) break;
       float evidence = 0.0f;
       for (float value : pristine_amplitude_llr) evidence += std::abs(value);
-      if (evidence <= 0.0f || !osd_allowed()) break;
+      if (evidence <= 0.0f || !optional_allowed()) break;
       std::array<float, 3 * kDataSymbols> refined{};
       decoder::refine_reliabilities(pristine_amplitude_llr, kRefineRounds, kRefineFeedback,
                                     refined);
@@ -972,25 +992,30 @@ auto ChannelDecoder<Mode>::attempt_decode(
       hard_errors = decoder::belief_propagation(amplitude_llr, payload, codeword);
     snr = -99.0f;
 
-    if (std::all_of(codeword.begin(), codeword.end(),
-                    [](std::int8_t bit) { return bit == 0; })) {
-      continue;
+    bool accepted = accepts_codeword(pass);
+#if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
+    // Keep the established pass-2 result whenever it passes all decode gates.
+    // Only a rejected result can spend the optional budget on another BP try.
+    if (!accepted && pass == 2 && observations && optional_allowed()) {
+      if (auto model = decoder::estimate_disturbance(*observations, kCostas, true, control)) {
+        auto channel = decoder::estimate_pilot_channel(*observations, kCostas, *model, control);
+        // An untrusted phase fit still permits the phase-independent Rician retry.
+        if (auto llrs = decoder::make_soft_likelihoods(
+                *observations, *model, channel ? &*channel : nullptr, control)) {
+          hard_errors = decoder::belief_propagation(*llrs, payload, codeword);
+          accepted = accepts_codeword(pass) && optional_allowed();
+        }
+      }
     }
-
-    // OSD's weighted discrepancy limits do not replace the hard-error limits.
-    if (!decoder::hard_errors_acceptable(pass, hard_errors, sync)) {
-      hard_errors = -1;
-      continue;
-    }
-
-    if (!decoder::crc_ok(payload)) continue;
+#endif
+    if (!accepted) continue;
     Frame frame{(payload[72] << 2) | (payload[73] << 1) | payload[74],
                 decoder::decode_message(payload)};
     if (pass == 6 && (!frame_readable(frame) ||
                       decoder::different_frame_near(reported_, frequency, offset, frame))) {
       continue;
     }
-    if (pass == 6 ? !osd_allowed() : !allowed()) return std::nullopt;
+    if (pass == 6 ? !optional_allowed() : !allowed()) return std::nullopt;
 
     if (sync_stats) {
       events::SyncState event;

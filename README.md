@@ -190,12 +190,15 @@ external PTT, offline status callbacks, and accelerated audio submission.
 
 ## Soft symbol likelihoods
 
-The second ordinary decode pass uses noncoherent soft likelihoods by default:
-it combines evidence from all eight tones and falls back to the previous
-metric when it cannot estimate a usable noise floor. Build with
-`-DJS8CORE_SOFT_DEMAPPER=OFF` to compare against the previous metric. See
-[the validation notes](docs/soft-likelihood-validation.md) for the model and
-paired benchmark results.
+Coherent data likelihoods are enabled by default. The decoder uses the known
+Costas pilots to validate a phase model for scoring the eight data tones. It
+tries this under the optional decode budget only if the established pass-2
+metric fails to produce an accepted frame.
+Set `EngineConfig::coherent_likelihood` (or `DecodeParams::coherent_likelihood`
+for direct decoder calls) to `false` to use the established second-pass metric.
+Build with `-DJS8CORE_SOFT_DEMAPPER=OFF` to disable both soft demappers. See
+[the validation notes](docs/soft-likelihood-validation.md) for the noncoherent
+model and its paired benchmark results.
 
 ## Experimental symbol tracking
 

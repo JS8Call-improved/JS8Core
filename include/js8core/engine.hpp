@@ -103,8 +103,8 @@ struct EngineConfig {
   int optional_decode_budget_ms = 250;
   // Report-only coherent Costas acquisition fallback, under the optional budget.
   bool deep_sync = true;
-  // Coherent data-likelihood soft symbols. Default off until validated on RF.
-  bool coherent_likelihood = false;
+  // Try coherent data likelihoods under the optional decode budget.
+  bool coherent_likelihood = true;
 };
 
 // Request to encode and transmit a user message.

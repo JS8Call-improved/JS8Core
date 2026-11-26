@@ -14,40 +14,52 @@ using namespace js8core::decoder;
 
 namespace {
 
-bool decodes_soft_fixture() {
+bool decodes_soft_fixture(bool inverted_data, bool coherent_likelihood) {
   using namespace js8core;
-  constexpr int kStart = 1350, kSymbol = 384, kWindow = 48000;
+  int const start = inverted_data ? 6000 : 1350;
+  int const symbol_samples = inverted_data ? 1920 : 384;
+  int const window = inverted_data ? 180000 : 48000;
+  auto const costas_type = inverted_data ? protocol::CostasType::Original
+                                        : protocol::CostasType::Modified;
   constexpr char frame[] = "Ux2zqX++++++";
   test::TrackingSignal signal;
-  signal.symbol_seconds = static_cast<double>(kSymbol) / kJs8RxSampleRate;
-  signal.start_seconds = static_cast<double>(kStart) / kJs8RxSampleRate;
+  signal.symbol_seconds = static_cast<double>(symbol_samples) / kJs8RxSampleRate;
+  signal.start_seconds = static_cast<double>(start) / kJs8RxSampleRate;
   signal.amplitude = 6000;
-  legacy_encode(4, protocol::costas(protocol::CostasType::Modified), frame, signal.tones.data());
+  legacy_encode(4, protocol::costas(costas_type), frame, signal.tones.data());
 
   DecodeState state;
   state.samples = test::render_tracking_audio(
-      std::array{test::TrackingWaveform(signal)}, kJs8RxSampleRate, kWindow);
-  std::mt19937 rng(105);
-  for (int i = 0; i < kWindow; ++i) {
+      std::array{test::TrackingWaveform(signal)}, kJs8RxSampleRate, window);
+  std::mt19937 rng(inverted_data ? 109 : 105);
+  int const data_amplitude = inverted_data ? -600 : 1295;
+  for (int i = 0; i < window; ++i) {
     // Keep the pilots strong enough for acquisition while making the data
     // marginal. Take the generator's bits directly for portable noise.
     int const noise = (static_cast<int>(rng() >> 16) - 32768) * 22000 / 65536;
-    int const symbol = i >= kStart ? (i - kStart) / kSymbol : -1;
+    int const symbol = i >= start ? (i - start) / symbol_samples : -1;
     int sample = state.samples[i];
     if (symbol >= 0 && symbol < kJs8NumSymbols && symbol % 36 >= 7)
-      sample = sample * 1295 / 6000;
+      sample = sample * data_amplitude / 6000;
     state.samples[i] = static_cast<std::int16_t>(sample + noise);
   }
   state.samples.resize(kJs8NtMax * kJs8RxSampleRate);
   state.params.nfa = 1400;
   state.params.nfb = 1610;
   state.params.nfqso = 1500;
-  state.params.nsubmodes = 1 << 4;
-  state.params.kszI = kWindow;
+  if (inverted_data) {
+    state.params.nsubmodes = 1;
+    state.params.kszA = window;
+  } else {
+    state.params.nsubmodes = 1 << 4;
+    state.params.kszI = window;
+  }
   state.params.symbol_tracking = SymbolTracking::Disabled;
   state.params.deep_sync = false;
+  state.params.coherent_likelihood = coherent_likelihood;
   DecodeControl control;
-  control.optional_allowed = [] { return false; };  // No OSD recovery.
+  if (!inverted_data)
+    control.optional_allowed = [] { return false; };  // No OSD recovery.
   bool found = false;
   decode_with_control(state, [&](events::Variant const& event) {
     auto const* decoded = std::get_if<events::Decoded>(&event);
@@ -153,9 +165,15 @@ int main() {
         has_positive_bits(short_head->end() - 3), "a partially observed leading data symbol is erased");
 
   constexpr bool expect_soft = JS8CORE_EXPECT_SOFT_DEMAPPER;
-  check(decodes_soft_fixture() == expect_soft,
+  check(decodes_soft_fixture(false, false) == expect_soft,
         expect_soft ? "pass 2 recovers the marginal frame with the soft metric"
                     : "the legacy metric does not recover the soft pass-2 fixture");
+  if (expect_soft) {
+    // Strong pilots predict the opposite phase from the one on the data.
+    // Replacing ordinary pass 2 with coherent scoring lost this frame.
+    check(decodes_soft_fixture(true, false) && decodes_soft_fixture(true, true),
+          "coherent retry preserves the established pass-2 recovery");
+  }
 
   return failures ? 1 : 0;
 }

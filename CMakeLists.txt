@@ -173,6 +173,8 @@ add_executable(js8core-soft-likelihood-benchmark EXCLUDE_FROM_ALL tools/soft_lik
 target_link_libraries(js8core-soft-likelihood-benchmark PRIVATE js8core)
 add_executable(js8core-coherent-likelihood-test EXCLUDE_FROM_ALL tools/coherent_likelihood_test.cpp)
 target_include_directories(js8core-coherent-likelihood-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(js8core-coherent-likelihood-test PRIVATE
+  JS8CORE_EXPECT_SOFT_DEMAPPER=$<BOOL:${JS8CORE_SOFT_DEMAPPER}>)
 target_link_libraries(js8core-coherent-likelihood-test PRIVATE js8core)
 
 add_executable(js8core-coherent-costas-test EXCLUDE_FROM_ALL tools/coherent_costas_test.cpp)

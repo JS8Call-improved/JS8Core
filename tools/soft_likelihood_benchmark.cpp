@@ -72,6 +72,7 @@ int main(int argc, char** argv) {
     state.params.symbol_tracking = SymbolTracking::Disabled;
     state.params.tracked_sic = false;
     state.params.deep_sync = false;
+    state.params.coherent_likelihood = false;
     state.params.nfa = 1250;
     state.params.nfb = 1810;
     state.params.nfqso = 1500;

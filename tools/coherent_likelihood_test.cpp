@@ -25,16 +25,80 @@
 
 #include "js8core/decoder.hpp"
 #include "js8core/decoder_state.hpp"
+#include "js8core/engine.hpp"
 #include "js8core/protocol/costas.hpp"
 
 #include "src/decoder/decoder_tables.hpp"
 #include "src/decoder/soft_likelihoods.hpp"
+#include "tracking_waveform.hpp"
 
 using namespace js8core;
 using namespace js8core::decoder;
 using namespace js8core::protocol;
 
 namespace {
+
+static_assert(DecodeParams{}.coherent_likelihood);
+static_assert(EngineConfig{}.coherent_likelihood);
+
+bool decode_phase_fixture() {
+  constexpr char frame[] = "Ux2zqX++++++";
+  constexpr int rate = 12000, count = 15 * rate, start = 6000, symbol_samples = 1920;
+  test::TrackingSignal wanted;
+  wanted.start_seconds = static_cast<double>(start) / rate;
+  wanted.symbol_seconds = static_cast<double>(symbol_samples) / rate;
+  wanted.amplitude = 1450;
+  wanted.phase_radians = 0.9;
+  legacy_encode(4, costas(CostasType::Original), frame, wanted.tones.data());
+
+  // Give each data symbol a stronger competing tone with the opposite
+  // phase. Its magnitude wins, but the Costas-based phase model rejects it.
+  auto competing = wanted;
+  competing.amplitude = 2300;
+  competing.phase_radians += test::kWaveTau / 2;
+  for (std::size_t symbol = 0; symbol < competing.tones.size(); ++symbol)
+    competing.tones[symbol] ^= 1 + static_cast<int>(symbol % 7);
+  test::TrackingWaveform const signal(wanted), interference(competing);
+
+  DecodeState state;
+  state.samples.resize(kJs8NtMax * rate);
+  std::mt19937 rng(105);
+  for (int i = 0; i < count; ++i) {
+    double const time = static_cast<double>(i) / rate;
+    int const symbol = (i - start) / symbol_samples;
+    double value = signal.at(time).imag();
+    if (symbol % 36 >= 7) value += interference.at(time).imag();
+    value += (static_cast<int>(rng() >> 16) - 32768) * 1600 / 65536;
+    state.samples[i] = static_cast<std::int16_t>(value);
+  }
+  state.params.nfa = 1450;
+  state.params.nfb = 1575;
+  state.params.nsubmodes = 1;
+  state.params.kszA = count;
+  state.params.symbol_tracking = SymbolTracking::Disabled;
+  state.params.deep_sync = false;
+
+  auto finds_frame = [&](DecodeControl const& control = {}) {
+    bool found = false;
+    decode_with_control(state, [&](events::Variant const& event) {
+      auto const* decoded = std::get_if<events::Decoded>(&event);
+      found |= decoded && decoded->type == 4 && decoded->data == frame;
+    }, control);
+    return found;
+  };
+  bool const by_default = finds_frame();
+  DecodeControl deny;
+  deny.optional_allowed = [] { return false; };
+  bool const with_no_budget = finds_frame(deny);
+  state.params.coherent_likelihood = false;
+  bool const opted_out = finds_frame();
+  if (by_default == static_cast<bool>(JS8CORE_EXPECT_SOFT_DEMAPPER) &&
+      !with_no_budget && !opted_out)
+    return true;
+  std::fprintf(stderr, "phase fixture: default=%d, no budget=%d, opted out=%d\n",
+               by_default, with_no_budget, opted_out);
+  return false;
+}
 
 std::uint32_t read_u32(std::ifstream& in) {
   std::uint8_t bytes[4]{};
@@ -312,6 +376,7 @@ int main(int argc, char** argv) {
   failures += noise_only_test() ? 0 : 1;
   failures += no_pilot_nan_test() ? 0 : 1;
   failures += large_phase_gate_test() ? 0 : 1;
+  failures += decode_phase_fixture() ? 0 : 1;
 
   std::printf("[decode-regression]\n");
   failures += run_decode_regression(argc, argv);

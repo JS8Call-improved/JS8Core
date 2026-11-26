@@ -39,8 +39,8 @@ struct DecodeParams {
   bool tracked_sic = true;
   // Budgeted Costas acquisition fallback. Results are report-only.
   bool deep_sync = true;
-  // Coherent data-likelihood soft symbols. Default off until validated on RF.
-  bool coherent_likelihood = false;
+  // Try coherent data likelihoods under the optional decode budget.
+  bool coherent_likelihood = true;
 };
 
 struct DecodeState {
