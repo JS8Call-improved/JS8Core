@@ -1,5 +1,6 @@
 #include "tracking_waveform.hpp"
 #include "js8core/decoder.hpp"
+#include "src/decoder/decode_quality.hpp"
 #include "src/decoder/frame_history.hpp"
 #include "src/decoder/symbol_tracking.hpp"
 #include "src/decoder/tracked_reference.hpp"
@@ -19,6 +20,24 @@ int main() {
     ++checks;
     if (!okay) { std::fprintf(stderr, "FAIL control: %s\n", name); ++failures; }
   };
+  using decoder::hard_errors_acceptable;
+  check(hard_errors_acceptable(6, 39, 2.0f) &&
+        !hard_errors_acceptable(6, 40, 2.0f),
+        "OSD shares the late-pass hard-error limit");
+  check(hard_errors_acceptable(6, 35, 1.999f) &&
+        !hard_errors_acceptable(6, 36, 1.999f) &&
+        hard_errors_acceptable(6, 36, 2.0f),
+        "OSD shares the low-sync hard-error limit only below 2.0");
+  check(!hard_errors_acceptable(6, -1, 2.0f),
+        "OSD failure is never acceptable");
+  check(hard_errors_acceptable(4, 30, 2.0f) &&
+        !hard_errors_acceptable(4, 31, 2.0f) &&
+        hard_errors_acceptable(5, 31, 2.0f),
+        "the 30-error cap remains specific to pass 4");
+  check(hard_errors_acceptable(2, 59, 2.0f) &&
+        !hard_errors_acceptable(2, 60, 2.0f),
+        "early passes keep their existing hard-error limit");
+
   decoder::Frame const candidate{4, "Ux2zqX++++++"};
   decoder::Frame const other_type{5, candidate.text};
   decoder::Frame const other_text{candidate.type, "HELLO-WORLD-"};

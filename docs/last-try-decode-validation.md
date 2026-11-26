@@ -17,8 +17,9 @@ uncover a weaker signal by cancellation. A frame independently recovered by
 belief propagation is still eligible for subtraction.
 
 The historical measurements below used the original offline implementation,
-which allowed OSD subtraction, compared nearby frames by text alone, and had
-no engine optional-work deadline.
+which allowed OSD subtraction, compared nearby frames by text alone, and did
+not apply the shared hard-error limits or an engine optional-work deadline to
+OSD.
 
 ## What the last try does
 
@@ -37,7 +38,9 @@ no engine optional-work deadline.
    - at least 9 of the 21 Costas tones match (the same minimum as pass 5);
    - the best score is at most 6.5% of the total |LLR|;
    - the best score beats the runner-up by at least 0.25% of the total |LLR|
-     (Forney's test, approximated with the runner-up).
+     (Forney's test, approximated with the runner-up);
+   - the shared late-pass limit allows at most 39 hard-decision disagreements,
+     or 35 when the sync score is below 2.0, in addition to the weighted limits.
 4. **Checks after the CRC:**
    - the frame must be readable by one of the unpackers (fast data when type
      bit 4 is set, else data, heartbeat, compound or directed); an unreadable

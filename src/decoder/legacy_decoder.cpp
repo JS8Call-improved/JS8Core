@@ -26,6 +26,7 @@
 #include "js8core/protocol/costas.hpp"
 #include "js8core/protocol/varicode.hpp"
 
+#include "decode_quality.hpp"
 #include "decoder_tables.hpp"
 #include "frame_history.hpp"
 #include "ldpc.hpp"
@@ -927,14 +928,8 @@ auto ChannelDecoder<Mode>::attempt_decode(
       continue;
     }
 
-    // The last try was judged by its own limits above.
-    bool const acceptable = pass == 6 ? hard_errors >= 0 :
-        hard_errors >= 0 && hard_errors < 60 &&
-        !(sync < 2.0f && hard_errors > 35) &&
-        !(pass > 2 && hard_errors > 39) &&
-        !(pass == 4 && hard_errors > 30);
-
-    if (!acceptable) {
+    // OSD's weighted discrepancy limits do not replace the hard-error limits.
+    if (!decoder::hard_errors_acceptable(pass, hard_errors, sync)) {
       hard_errors = -1;
       continue;
     }
