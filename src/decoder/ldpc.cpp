@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "decoder_tables.hpp"
+#include "js8core/decode_control.hpp"
 
 namespace js8core::decoder {
 namespace {
@@ -285,9 +286,12 @@ int ordered_statistics_decode(std::array<float, 174> const& llr,
                               std::array<std::int8_t, 174>& codeword,
                               int order, float* discrepancy, bool filtered,
                               float* runner_up,
-                              std::array<float, 174> const* order_by) {
+                              std::array<float, 174> const* order_by,
+                              DecodeControl const* control) {
   using namespace data;
   using Row = CodewordBits;
+  auto allowed = [&] { return !control || control->allow_optional(); };
+  if (!allowed()) return -1;
   auto const& reliability = order_by ? *order_by : llr;
 
   // Generator row r: message bit r contributes to parity bit p when
@@ -365,6 +369,7 @@ int ordered_statistics_decode(std::array<float, 174> const& llr,
   };
   if (order >= 1) {
     for (std::size_t a = 0; a < kPayloadBits; ++a) {
+      if (!allowed()) return -1;
       Row const one = base ^ rows[a];
       float const c1 = cost(one);
       consider(one, c1);
@@ -415,6 +420,7 @@ int ordered_statistics_decode(std::array<float, 174> const& llr,
     // Order 3, rule 1: three pivot disagreements plus at most theta - 3 on
     // the t positions.
     for (std::size_t a = 0; a < kPayloadBits; ++a) {
+      if (!allowed()) return -1;
       for (std::size_t b = a + 1; b < kPayloadBits; ++b) {
         std::uint64_t const ab = packed_mismatch ^ packed_row[a] ^ packed_row[b];
         for (std::size_t c = b + 1; c < kPayloadBits; ++c) {
@@ -462,6 +468,7 @@ int ordered_statistics_decode(std::array<float, 174> const& llr,
         }
       }
       for (std::size_t a = 0; a < kPayloadBits; ++a) {
+        if (!allowed()) return -1;
         for (std::size_t b = a + 1; b < kPayloadBits; ++b) {
           std::uint32_t const ab = static_cast<std::uint32_t>(
               (packed_mismatch ^ packed_row[a] ^ packed_row[b]) & kTauMask);
@@ -478,6 +485,8 @@ int ordered_statistics_decode(std::array<float, 174> const& llr,
     }
   }
 
+  // A partial search cannot establish the winning score or runner-up gap.
+  if (!allowed()) return -1;
   int errors = 0;
   for (std::size_t k = 0; k < kCodeLength; ++k) {
     codeword[k] = best.test(k) ? 1 : 0;

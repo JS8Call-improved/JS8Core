@@ -5,6 +5,10 @@
 #include <cstdint>
 #include <string>
 
+namespace js8core {
+struct DecodeControl;
+}
+
 namespace js8core::decoder {
 
 // Maps a six-bit JS8 alphabet character to its word value (0-63), or 0xFF when
@@ -41,13 +45,15 @@ int belief_propagation(std::array<float, 174> const& llr,
 // bit values in place of `llr`; candidates are still scored against `llr`
 // (Fossorier, IEEE JSAC 19(5), 2001). With `order_by`, the 4-flip search is
 // skipped (see ldpc.cpp).
+// If `control` denies optional work, returns -1 without updating the outputs.
 int ordered_statistics_decode(std::array<float, 174> const& llr,
                               std::array<std::int8_t, 87>& payload,
                               std::array<std::int8_t, 174>& codeword,
                               int order, float* discrepancy,
                               bool filtered = false,
                               float* runner_up = nullptr,
-                              std::array<float, 174> const* order_by = nullptr);
+                              std::array<float, 174> const* order_by = nullptr,
+                              DecodeControl const* control = nullptr);
 
 // A few rounds of belief propagation from `llr`, with the check messages
 // multiplied by `feedback` (below 1), giving each bit's updated value in

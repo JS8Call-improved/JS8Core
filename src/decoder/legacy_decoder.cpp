@@ -913,12 +913,13 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
   normalize(amplitude_llr);
   normalize(logarithmic_llr);
   // Later erasure passes modify amplitude_llr. Preserve the full evidence
-  // for one optional stronger BP run after the standard decode sequence.
+  // for stronger BP and the optional last-try OSD.
   auto const pristine_amplitude_llr = amplitude_llr;
 
   std::array<std::int8_t, kPayloadBits> payload{};
   std::array<std::int8_t, kCodeLength> codeword{};
 
+  auto osd_allowed = [&] { return !control || control->allow_optional(); };
   for (int pass = 1; pass <= 6; ++pass) {
     if (!allowed()) return std::nullopt;
     std::array<float, 3 * kDataSymbols> rescue_llr{};
@@ -928,7 +929,7 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
       if (tracking != SymbolTracking::Disabled || sync_matches < kOsdMinSyncMatches) break;
       float evidence = 0.0f;
       for (float value : pristine_amplitude_llr) evidence += std::abs(value);
-      if (evidence <= 0.0f) break;
+      if (evidence <= 0.0f || !osd_allowed()) break;
       std::array<float, 3 * kDataSymbols> refined{};
       decoder::refine_reliabilities(pristine_amplitude_llr, kRefineRounds, kRefineFeedback,
                                     refined);
@@ -936,7 +937,7 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
       float runner_up = 0.0f;
       hard_errors = decoder::ordered_statistics_decode(
           pristine_amplitude_llr, payload, codeword, kOsdOrder, &discrepancy, true,
-          &runner_up, &refined);
+          &runner_up, &refined, control);
       if (hard_errors < 0 || discrepancy > kOsdMaxDiscrepancy * evidence ||
           runner_up - discrepancy < kOsdMinRunnerUpGap * evidence) {
         hard_errors = -1;
@@ -987,7 +988,7 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
                       different_frame_near(frequency, offset, decoder::decode_message(payload)))) {
       continue;
     }
-    if (!allowed()) return std::nullopt;
+    if (pass == 6 ? !osd_allowed() : !allowed()) return std::nullopt;
 
     if (sync_stats) {
       events::SyncState event;

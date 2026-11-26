@@ -7,6 +7,12 @@ the answer only if it passes four checks besides the CRC. The candidate search,
 timing, the reading of the tones and passes 1 to 5 are unchanged, and tracked
 attempts (`--tracking`) do not use the last try.
 
+In the engine, the last try now shares `EngineConfig::optional_decode_budget_ms`
+with tracking and tracked cancellation. It yields to queued captures or an
+expired deadline; a search interrupted by either condition cannot report a
+frame or subtract it from the audio. The validation results below used the
+offline decoder without the engine's optional-work deadline.
+
 ## What the last try does
 
 1. **Search order.** Three damped belief-propagation rounds on the same

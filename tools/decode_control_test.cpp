@@ -3,7 +3,9 @@
 #include "src/decoder/symbol_tracking.hpp"
 #include "src/decoder/tracked_reference.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <random>
 #include <stdexcept>
 
 using namespace js8core;
@@ -24,7 +26,7 @@ int main() {
   state.samples.resize(720000);
   state.params.nfa = 1400; state.params.nfb = 1800; state.params.nfqso = 1500;
   state.params.nsubmodes = 1 << 4; state.params.kszI = 48000;
-  auto run = [&](DecodeControl const& control) {
+  auto run = [](DecodeState const& state, DecodeControl const& control) {
     std::pair<std::vector<events::Decoded>, events::DecodeFinished> result;
     decode_with_control(state, [&](auto const& event) {
       if (auto d = std::get_if<events::Decoded>(&event)) result.first.push_back(*d);
@@ -32,7 +34,7 @@ int main() {
     }, control);
     return result;
   };
-  auto baseline = run({});
+  auto baseline = run(state, {});
   check(!baseline.first.empty(), "ordinary positive fixture decodes");
   auto const legacy_binding = &legacy_decode;
   std::vector<events::Decoded> compatible;
@@ -45,7 +47,7 @@ int main() {
   DecodeControl denied;
   int probes = 0;
   denied.optional_allowed = [&] { return ++probes != 1; }; // A denial must remain latched.
-  auto limited = run(denied);
+  auto limited = run(state, denied);
   check(limited.second.optional_work_skipped && !limited.second.canceled, "optional denial reported separately");
   check(probes == 1, "optional work cannot resume after a transient denial");
   check(limited.first.size() == baseline.first.size(), "ordinary results survive optional denial");
@@ -56,20 +58,67 @@ int main() {
   }
   DecodeControl canceled;
   canceled.cancel_requested = [] { return true; };
-  auto stopped = run(canceled);
+  auto stopped = run(state, canceled);
   check(stopped.first.empty() && stopped.second.canceled && stopped.second.tracked_cancellations == 0,
         "canceled snapshots publish no frames or residual commits");
   int cancel_probes = 0;
   canceled.cancel_requested = [&] { return ++cancel_probes == 20; };
-  auto transient_cancel = run(canceled);
+  auto transient_cancel = run(state, canceled);
   check(transient_cancel.first.empty() && transient_cancel.second.canceled && cancel_probes == 20,
         "mid-search cancellation remains latched even if the caller would re-enable work");
   DecodeControl throws;
   throws.optional_allowed = []() -> bool { throw std::runtime_error("optional policy"); };
-  auto failed_optional = run(throws);
+  auto failed_optional = run(state, throws);
   check(failed_optional.second.optional_work_skipped && !failed_optional.first.empty(), "optional exception fails closed");
   throws.cancel_requested = []() -> bool { throw std::runtime_error("cancel policy"); };
-  check(run(throws).second.canceled, "cancel exception fails closed");
+  check(run(state, throws).second.canceled, "cancel exception fails closed");
+
+  // A weak fast-data frame ("LAST TRY") needs OSD; a stronger frame in the
+  // same window must still decode after OSD is denied or interrupted.
+  constexpr char weak_frame[] = "Ux2zqX++++++";
+  auto weak = signal;
+  weak.amplitude = 3400;
+  legacy_encode(4, costas, weak_frame, weak.tones.data());
+  auto strong = signal;
+  strong.base_hz = 1700;
+  strong.amplitude = 7500;
+  DecodeState osd_state;
+  osd_state.params = state.params;
+  osd_state.params.nfa = 1470;
+  osd_state.params.nfb = 1740;
+  osd_state.params.symbol_tracking = SymbolTracking::Disabled;
+  osd_state.samples = test::render_tracking_audio(
+      std::array{test::TrackingWaveform(weak), test::TrackingWaveform(strong)}, 12000, 48000);
+  // Use the generator's bits directly so the noise is identical across standard libraries.
+  std::mt19937 rng(71);
+  for (auto& sample : osd_state.samples) {
+    int const noise = (static_cast<int>(rng() >> 16) - 32768) * 44000 / 65536;
+    sample = static_cast<std::int16_t>(std::clamp(sample + noise, -32768, 32767));
+  }
+  osd_state.samples.resize(720000);
+
+  auto contains = [](auto const& result, char const* text, int type) {
+    return std::any_of(result.first.begin(), result.first.end(), [&](auto const& frame) {
+      return frame.data == text && frame.type == type;
+    });
+  };
+  auto osd_baseline = run(osd_state, {});
+  check(contains(osd_baseline, weak_frame, 4) && contains(osd_baseline, "HELLO-WORLD-", 2) &&
+        !osd_baseline.second.optional_work_skipped && !osd_baseline.second.canceled,
+        "admitted OSD recovers the weak frame alongside the ordinary frame");
+  DecodeControl osd_limit;
+  osd_limit.optional_allowed = [] { return false; };
+  auto osd_denied = run(osd_state, osd_limit);
+  check(!contains(osd_denied, weak_frame, 4) && contains(osd_denied, "HELLO-WORLD-", 2) &&
+        osd_denied.second.optional_work_skipped && !osd_denied.second.canceled,
+        "OSD entry denial does not stop ordinary decoding");
+  int osd_probes = 0;
+  osd_limit.optional_allowed = [&] { return ++osd_probes != 16; };
+  auto osd_interrupted = run(osd_state, osd_limit);
+  check(osd_probes == 16 && !contains(osd_interrupted, weak_frame, 4) &&
+        contains(osd_interrupted, "HELLO-WORLD-", 2) &&
+        osd_interrupted.second.optional_work_skipped && !osd_interrupted.second.canceled,
+        "mid-search OSD denial is latched; no weak frame is published");
 
   std::vector<std::complex<float>> channel(1100, {1, 0});
   int calls = 0;

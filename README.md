@@ -201,7 +201,8 @@ tracking is `Both`. It defaults to true and requires complete
 frequency/timing fits, CRC validation and a guarded energy-reducing residual.
 New results from that residual have `Decoded::after_tracked_sic` set to true.
 
-Optional receive work yields to queued captures and a monotonic deadline set by
+Optional receive work (last-try OSD, symbol tracking, and tracked cancellation)
+yields to queued captures and a monotonic deadline set by
 `EngineConfig::optional_decode_budget_ms` (250 ms by default). Zero disables
 optional work without disabling mandatory decoding. Stale capture epochs and
 overwritten windows are canceled rather than delivered into a newer RX context.
