@@ -179,6 +179,12 @@ that `feaec6f` decodes is lost on any of the four crowded sets.
   JS8Call-improved v3.0.3 release decodes it too; the desktop reference
   (`0130e04`) and `feaec6f` do not.
 
+CI now expects five JS8Core decodes on each copy of that recording. The desktop
+comparison still requires all pinned desktop records and additionally requires
+the two exact JS8Core-only frame identities in
+[`expected_core_only.tsv`](../tools/reference/expected_core_only.tsv), with the
+same metadata tolerances. Other extra records are failures.
+
 ## Not tested
 
 - Tracking on for the 36 sets without both drift and clock offset.

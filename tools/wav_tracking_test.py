@@ -117,7 +117,7 @@ def main():
         known = root / "A_1_4.wav"
         known.write_bytes(silence.read_bytes())
         result = run(["--tracking", "both", "A", known], expected=1)
-        if "expected reference 4" not in result.stderr:
+        if "expected reference 5" not in result.stderr:
             raise AssertionError("tracking bypassed the frozen baseline count gate")
         run(["--tracking", "both", "--records", "A", known])
         for options in ([], ["--records"], ["--tracking"],

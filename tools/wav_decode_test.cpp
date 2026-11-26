@@ -263,18 +263,18 @@ int main(int argc, char** argv) {
     }
     // The full-record A/B comparator validates exact identities and numeric
     // metadata when --records is requested. Keep native count-only gates
-    // separately, using counts recorded from the pinned desktop revision.
+    // separately, using the expected JS8Core counts for the pinned fixtures.
     if (records) continue;
 
-    // Expected desktop counts with this search band and mode configuration.
-    // Filename suffixes reflect a different historical decoder invocation.
+    // A_1_4 and A_2_5 are the same recording; JS8Core's last-try decoder
+    // recovers one more frame than the pinned desktop decoder on each.
     struct Known {
       char const* name;
       int expected;
     };
     static constexpr std::array<Known, 9> kReference = {{
-        {"A_1_4.wav", 4}, {"A_2_1.wav", 0}, {"A_2_3.wav", 3},
-        {"A_2_5.wav", 4}, {"A_2_6.wav", 4}, {"A_2_9.wav", 8},
+        {"A_1_4.wav", 5}, {"A_2_1.wav", 0}, {"A_2_3.wav", 3},
+        {"A_2_5.wav", 5}, {"A_2_6.wav", 4}, {"A_2_9.wav", 8},
         {"A_3_3.wav", 3}, {"E_1_1.wav", 1}, {"E_2_1.wav", 1},
     }};
     for (auto const& known : kReference) {

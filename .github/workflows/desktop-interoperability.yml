@@ -83,6 +83,7 @@ jobs:
           python3 tools/reference/compare_wav_results.py \
             --desktop build/desktop-records.tsv \
             --core build/core-records.tsv \
+            --expected-core-only tools/reference/expected_core_only.tsv \
             --freq-hz 3 --dt-seconds 0.15 --snr-db 6 --quality 0.30
 
       - name: Preserve reference and candidate outputs

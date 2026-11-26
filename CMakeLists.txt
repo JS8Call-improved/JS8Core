@@ -227,6 +227,8 @@ if(BUILD_TESTING)
     add_test(NAME js8core-wav-tracking-tool
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/wav_tracking_test.py
         $<TARGET_FILE:js8core-wav-decode-test> --work-dir ${CMAKE_CURRENT_BINARY_DIR})
+    add_test(NAME js8core-wav-reference-comparator
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tools/reference/compare_wav_results_test.py)
   endif()
   add_test(NAME js8core-engine-smoke COMMAND js8core-engine-smoke-test)
 endif()
