@@ -37,6 +37,8 @@ struct DecodeParams {
   SymbolTracking symbol_tracking = SymbolTracking::Both;
   // Enabled by default; requires Both tracking and two valid fitted components.
   bool tracked_sic = true;
+  // Budgeted Costas acquisition fallback. Results are report-only.
+  bool deep_sync = true;
 };
 
 struct DecodeState {

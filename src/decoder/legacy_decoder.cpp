@@ -26,6 +26,7 @@
 #include "js8core/protocol/costas.hpp"
 #include "js8core/protocol/varicode.hpp"
 
+#include "coherent_costas.hpp"
 #include "decode_quality.hpp"
 #include "decoder_tables.hpp"
 #include "frame_history.hpp"
@@ -136,6 +137,17 @@ struct Candidate {
   float score;
 };
 
+enum class CandidateSearch { Ordinary, Tracking, Deep };
+constexpr std::size_t kDeepSyncSeedLimit = 8;
+constexpr int kDeepSyncDecodeLimit = 3;
+constexpr float kDeepSyncSeedFloor = 1.0f;
+constexpr double kDeepSyncSupport = 0.16;
+
+struct DeepSyncWindow {
+  int count = 0;
+  Frame::Map decoded;
+};
+
 // Per-submode decoder. All buffers are sized from the ModeProfile so that one
 // template instantiation handles each JS8 speed level.
 template <typename Mode>
@@ -145,7 +157,9 @@ class ChannelDecoder {
 
   std::size_t operator()(dec_data const& data, int position, int size,
                          EventEmitter emit, std::size_t& tracked_cancellations,
-                         DecodeControl const& control);
+                         DecodeControl const& control, DeepSyncWindow* deferred = nullptr);
+  std::size_t deep_sync(dec_data const& data, DeepSyncWindow& window, EventEmitter emit,
+                        DecodeControl const& control);
 
  private:
   using Spectrum = std::array<std::complex<float>, Mode::fft_span / 2 + 1>;
@@ -168,8 +182,8 @@ class ChannelDecoder {
   // --- Synchronization and demodulation ------------------------------------
 
   std::vector<Candidate> find_candidates(int low_hz, int high_hz,
-      DecodeControl const* control = nullptr, bool optional = false);
-  float alignment_score(int offset, float frequency_delta);
+      DecodeControl const* control, CandidateSearch search = CandidateSearch::Ordinary);
+  float alignment_score(int offset, float frequency_delta, int available = Mode::payload_samples);
   // Frames reported so far in this period, for the last-try position check.
   std::vector<decoder::ReportedFrame> reported_;
   struct AttemptResult {
@@ -181,7 +195,7 @@ class ChannelDecoder {
       int& hard_errors, float& snr, int& rescue_budget, EventEmitter emit,
       SymbolTracking tracking = SymbolTracking::Disabled, int received_samples = 0,
       std::optional<decoder::TrackedTrajectory>* trajectory = nullptr,
-      DecodeControl const* control = nullptr);
+      DecodeControl const* control = nullptr, decoder::CoherentCostasPeak const* deep = nullptr);
 
   // --- Signal reconstruction -----------------------------------------------
 
@@ -450,7 +464,7 @@ void ChannelDecoder<Mode>::compute_baseline(int first, int last) {
 // ---------------------------------------------------------------------------
 
 template <typename Mode>
-float ChannelDecoder<Mode>::alignment_score(int offset, float frequency_delta) {
+float ChannelDecoder<Mode>::alignment_score(int offset, float frequency_delta, int available) {
   constexpr float down_rate = 12000.0f / Mode::downsample_factor;
   constexpr float phase_step = kTau / down_rate;
 
@@ -472,7 +486,7 @@ float ChannelDecoder<Mode>::alignment_score(int offset, float frequency_delta) {
     for (int column = 0; column < 7; ++column) {
       int const start =
           36 * block * Mode::downsample_sps + offset + column * Mode::downsample_sps;
-      if (start < 0 || start + Mode::downsample_sps > Mode::payload_samples) {
+      if (start < 0 || start + Mode::downsample_sps > available) {
         continue;
       }
 
@@ -493,7 +507,8 @@ float ChannelDecoder<Mode>::alignment_score(int offset, float frequency_delta) {
 
 template <typename Mode>
 std::vector<Candidate> ChannelDecoder<Mode>::find_candidates(int low_hz,
-    int high_hz, DecodeControl const* control, bool optional) {
+    int high_hz, DecodeControl const* control, CandidateSearch search) {
+  bool const optional = search != CandidateSearch::Ordinary;
   // Invalid or inverted bands must not reach the polynomial baseline fit or
   // be turned into negative/huge vector allocation sizes.
   if (low_hz >= high_hz || high_hz <= 0 || low_hz > 4910) return {};
@@ -620,15 +635,17 @@ std::vector<Candidate> ChannelDecoder<Mode>::find_candidates(int low_hz,
 
   std::vector<char> removed(entries.size(), 0);
   std::vector<Candidate> selected;
+  float const floor = search == CandidateSearch::Deep ? kDeepSyncSeedFloor : kMinSync;
+  std::size_t const limit = search == CandidateSearch::Deep ? kDeepSyncSeedLimit : kMaxCandidates;
 
   for (std::size_t index : order) {
     if (removed[index]) continue;
 
     Candidate const& candidate = entries[index];
-    if (!std::isfinite(candidate.score) || candidate.score < kMinSync) break;
+    if (!std::isfinite(candidate.score) || candidate.score < floor) break;
 
     selected.push_back(candidate);
-    if (selected.size() >= kMaxCandidates) break;
+    if (selected.size() >= limit) break;
 
     for (std::size_t other = 0; other < entries.size(); ++other) {
       if (!removed[other] &&
@@ -646,12 +663,14 @@ auto ChannelDecoder<Mode>::attempt_decode(
     bool sync_stats, bool subtract, float& frequency, float& offset,
     int& hard_errors, float& snr, int& rescue_budget, EventEmitter emit,
     SymbolTracking tracking, int received_samples,
-    std::optional<decoder::TrackedTrajectory>* trajectory, DecodeControl const* control)
+    std::optional<decoder::TrackedTrajectory>* trajectory, DecodeControl const* control,
+    decoder::CoherentCostasPeak const* deep)
     -> std::optional<AttemptResult> {
   if (trajectory) trajectory->reset();
   auto allowed = [&] {
-    return !control || (!control->is_canceled() &&
-        (tracking == SymbolTracking::Disabled || control->allow_optional()));
+    return !control || (deep ? control->allow_optional() :
+        (!control->is_canceled() &&
+         (tracking == SymbolTracking::Disabled || control->allow_optional())));
   };
   if (!allowed()) return std::nullopt;
   constexpr float frequency_resolution = 12000.0f / Mode::fft_span;
@@ -666,60 +685,66 @@ auto ChannelDecoder<Mode>::attempt_decode(
   float const acquisition_frequency = frequency;
   extract_channel(frequency);
 
-  int origin = static_cast<int>(std::round((offset + Mode::start_seconds) * down_rate));
-  float best_score = 0.0f;
   int best_time = 0;
-
-  for (int candidate = origin - Mode::quarter_symbol;
-       candidate <= origin + Mode::quarter_symbol; ++candidate) {
-    float const score = alignment_score(candidate, 0.0f);
-    if (score > best_score) {
-      best_score = score;
-      best_time = candidate;
-    }
-  }
-
-  float refined_offset = best_time * down_period;
-  origin = static_cast<int>(std::round(refined_offset * down_rate));
-  best_score = 0.0f;
   float best_delta = 0.0f;
+  if (deep) {
+    // The coherent peak is already registered against the actual FFT bin.
+    best_time = deep->frame_start;
+    best_delta = static_cast<float>(deep->frequency_offset_hz);
+    constexpr float resolution = 12000.0f / Mode::ds_fft_span;
+    frequency = std::round(frequency / resolution) * resolution;
+  } else {
+    int origin = static_cast<int>(std::round((offset + Mode::start_seconds) * down_rate));
+    float best_score = 0.0f;
+    for (int candidate = origin - Mode::quarter_symbol;
+         candidate <= origin + Mode::quarter_symbol; ++candidate) {
+      float const score = alignment_score(candidate, 0.0f);
+      if (score > best_score) {
+        best_score = score;
+        best_time = candidate;
+      }
+    }
 
-  for (int step = -kFreqSearchSteps; step <= kFreqSearchSteps; ++step) {
-    float const delta = step * 0.5f;
-    float const score = alignment_score(origin, delta);
-    if (score > best_score) {
-      best_score = score;
-      best_delta = delta;
+    origin = static_cast<int>(std::round(best_time * down_period * down_rate));
+    best_score = 0.0f;
+    for (int step = -kFreqSearchSteps; step <= kFreqSearchSteps; ++step) {
+      float const delta = step * 0.5f;
+      float const score = alignment_score(origin, delta);
+      if (score > best_score) {
+        best_score = score;
+        best_delta = delta;
+      }
+    }
+
+    // Time again at the corrected frequency, over half the first window.
+    float best_retime = 0.0f;
+    best_time = origin;
+    for (int candidate = origin - Mode::quarter_symbol / 2;
+         candidate <= origin + Mode::quarter_symbol / 2; ++candidate) {
+      float const score = alignment_score(candidate, best_delta);
+      if (score > best_retime) {
+        best_retime = score;
+        best_time = candidate;
+      }
     }
   }
-
-  // Time again at the corrected frequency, over half the first window (as
-  // WSJT-X does in ft8b).
-  float best_retime = 0.0f;
-  int retime = origin;
-  for (int candidate = origin - Mode::quarter_symbol / 2;
-       candidate <= origin + Mode::quarter_symbol / 2; ++candidate) {
-    float const score = alignment_score(candidate, best_delta);
-    if (score > best_retime) {
-      best_retime = score;
-      retime = candidate;
-    }
-  }
-  best_time = retime;
-  refined_offset = best_time * down_period;
-  origin = static_cast<int>(std::round(refined_offset * down_rate));
+  float const refined_offset = best_time * down_period;
+  int const origin = static_cast<int>(std::round(refined_offset * down_rate));
+  int const demodulation_limit = deep
+      ? std::min(Mode::ds_fft_out, received_samples / Mode::downsample_factor)
+      : Mode::payload_samples;
 
   float const phase_step = -best_delta * (kTau / down_rate);
   std::complex<float> const rotation_step = std::polar(1.0f, phase_step);
   std::complex<float> rotation{1.0f, 0.0f};
-  for (int i = 0; i < Mode::payload_samples; ++i) {
+  for (int i = 0; i < demodulation_limit; ++i) {
     rotation *= rotation_step;
     channel_[static_cast<std::size_t>(i)] *= rotation;
   }
 
   offset = refined_offset;
   frequency += best_delta;
-  float const sync = alignment_score(origin, 0.0f);
+  float const sync = alignment_score(origin, 0.0f, demodulation_limit);
 
   std::array<std::array<float, kChannelSymbols>, kToneRows> tone_power{};
 
@@ -765,7 +790,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
     if (!tracked_symbols.empty()) {
       auto const first = tracked_symbols.begin() + symbol * Mode::downsample_sps;
       std::copy_n(first, Mode::downsample_sps, symbol_fft_.begin());
-    } else if (start >= 0 && start + Mode::downsample_sps <= Mode::payload_samples) {
+    } else if (start >= 0 && start + Mode::downsample_sps <= demodulation_limit) {
       std::copy(channel_.begin() + start,
                 channel_.begin() + start + Mode::downsample_sps,
                 symbol_fft_.begin());
@@ -866,7 +891,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
   auto pass_two_llrs = [&] {
 #if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
     if (tracking == SymbolTracking::Disabled) {
-      int const available = std::min(Mode::payload_samples, received_samples / Mode::downsample_factor);
+      int const available = std::min(demodulation_limit, received_samples / Mode::downsample_factor);
       if (auto soft = decoder::soft_frame_llrs(tone_power, kCostas, best_time,
                                                Mode::downsample_sps, available))
         return *soft;
@@ -880,7 +905,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
   std::array<std::int8_t, kCodeLength> codeword{};
 
   auto osd_allowed = [&] { return !control || control->allow_optional(); };
-  for (int pass = 1; pass <= 6; ++pass) {
+  for (int pass = 1; pass <= (deep ? 4 : 6); ++pass) {
     if (!allowed()) return std::nullopt;
     std::array<float, 3 * kDataSymbols> rescue_llr{};
     if (pass == 6) {
@@ -960,7 +985,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
 
     // OSD's best guess can pass the CRC by chance. Report it, but do not let
     // it change the residual seen by later ordinary or tracked attempts.
-    bool const subtracted = subtract && pass != 6 &&
+    bool const subtracted = subtract && !deep && pass != 6 &&
         subtract_reference(make_reference(tones, frequency), refined_offset);
 
     float signal_power = 0.0f;
@@ -1058,7 +1083,7 @@ template <typename Mode>
 std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
                                              int size, EventEmitter emit,
                                              std::size_t& tracked_cancellations,
-                                             DecodeControl const& control) {
+                                             DecodeControl const& control, DeepSyncWindow* deferred) {
   if (control.is_canceled()) return 0;
   int const pos = std::max(0, position);
   int const count = std::clamp(size, 0, Mode::nmax);
@@ -1155,7 +1180,8 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
     std::vector<std::pair<Frame, decoder::TrackedTrajectory>> pending;
     auto tracking_pass = [&](bool after_cancellation) {
       if (!control.allow_optional()) return;
-      auto const candidates = find_candidates(data.params.nfa, data.params.nfb, &control, true);
+      auto const candidates = find_candidates(data.params.nfa, data.params.nfb, &control,
+                                              CandidateSearch::Tracking);
       if (!control.allow_optional()) return;
       prepare_baseband();  // SIC may have changed samples since the previous FFT.
       int tracking_budget = 8;
@@ -1228,7 +1254,80 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
     }
   }
 
-  return decoded.size();
+  auto const decoded_count = decoded.size();
+  if (deferred && !control.is_canceled()) *deferred = {count, std::move(decoded)};
+  return decoded_count;
+}
+
+template <typename Mode>
+std::size_t ChannelDecoder<Mode>::deep_sync(dec_data const& data, DeepSyncWindow& window,
+                                            EventEmitter emit, DecodeControl const& control) {
+  int const available = std::min(Mode::ds_fft_out, window.count / Mode::downsample_factor);
+  // Two complete Costas blocks need at least 36 + 7 symbols of observed time.
+  if (available < 43 * Mode::downsample_sps || !control.allow_optional()) return 0;
+  int const low = std::max(data.params.nfa, 100);
+  int const high = std::min(data.params.nfb, 4910);
+  if (low >= high) return 0;
+
+  auto const seeds = find_candidates(low, high, &control, CandidateSearch::Deep);
+  if (seeds.empty() || !control.allow_optional()) return 0;
+  auto const reference = decoder::CoherentCostasReference::make(Mode::downsample_sps, kCostas);
+  if (!reference) return 0;
+  // Rebuild from the final residual after original and tracked cancellation.
+  prepare_baseband();
+
+  constexpr float resolution = 12000.0f / Mode::ds_fft_span;
+  constexpr float down_rate = 12000.0f / Mode::downsample_factor;
+  constexpr float tone_hz = down_rate / Mode::downsample_sps;
+  struct Hypothesis {
+    float seed_frequency;
+    double frequency;
+    decoder::CoherentCostasPeak peak;
+  };
+  std::vector<Hypothesis> peaks;
+  peaks.reserve(seeds.size());
+  for (auto const& seed : seeds) {
+    if (!control.allow_optional()) return 0;
+    extract_channel(seed.frequency);
+    double const center = std::round(seed.frequency / resolution) * resolution;
+    int const start = static_cast<int>(std::round((seed.offset + Mode::start_seconds) * down_rate));
+    auto const peak = reference->search(std::span(channel_).first(available), start, down_rate,
+                                        low - center, high - center, control);
+    if (peak && peak->support >= kDeepSyncSupport)
+      peaks.push_back({seed.frequency, center + peak->frequency_offset_hz, *peak});
+  }
+  std::stable_sort(peaks.begin(), peaks.end(), [](auto const& a, auto const& b) {
+    return a.peak.support > b.peak.support;
+  });
+
+  std::array<Hypothesis const*, kDeepSyncDecodeLimit> attempted{};
+  std::size_t attempts = 0, added = 0;
+  for (auto const& hypothesis : peaks) {
+    if (attempts == attempted.size() || !control.allow_optional()) break;
+    auto const prior = std::span(attempted).first(attempts);
+    if (std::any_of(prior.begin(), prior.end(), [&](auto const* other) {
+          return std::abs(hypothesis.frequency - other->frequency) < tone_hz / 4.0 &&
+              std::abs(hypothesis.peak.frame_start - other->peak.frame_start) <= Mode::quarter_symbol;
+        })) continue;
+    attempted[attempts++] = &hypothesis;
+
+    float frequency = hypothesis.seed_frequency;
+    float offset = 0.0f, snr = 0.0f;
+    int hard_errors = -1, no_rescue = 0;
+    auto frame = attempt_decode(false, false, frequency, offset, hard_errors, snr, no_rescue,
+                                 emit, SymbolTracking::Disabled, window.count, nullptr, &control,
+                                 &hypothesis.peak);
+    if (!frame) continue;
+    if (!control.allow_optional()) break;
+    int const rounded_snr = static_cast<int>(std::round(snr));
+    auto [slot, inserted] = window.decoded.try_emplace(std::move(frame->frame), rounded_snr);
+    if (!inserted) continue;
+    ++added;
+    emit(events::Decoded{data.params.utc, rounded_snr, offset - Mode::start_seconds, frequency,
+                         slot->first.text, slot->first.type, 1.0f - hard_errors / 60.0f,
+                         Mode::event_mode});
+  }
+  return added;
 }
 
 }  // namespace
@@ -1265,32 +1364,47 @@ std::size_t decode_with_control(DecodeState const& state,
     };
   }
 
-  auto run = [&](auto& decoder, int position, int size) {
+  auto run = [&](auto& decoder, int position, int size, DeepSyncWindow& deferred) {
     using Decoder =
         typename std::remove_reference_t<decltype(decoder)>::element_type;
     if (!decoder) decoder = std::make_unique<Decoder>();
-    return (*decoder)(state, position, size, emit, tracked_cancellations, control);
+    return (*decoder)(state, position, size, emit, tracked_cancellations, control,
+                      state.params.deep_sync ? &deferred : nullptr);
   };
 
   int const submodes = state.params.nsubmodes;
   std::size_t total = 0;
+  DeepSyncWindow deep_a, deep_b, deep_c, deep_e, deep_i;
 
   emit(events::DecodeStarted{submodes});
 
   if ((submodes & (1 << ProfileI::bit_index)) != 0) {
-    total += run(decoder_i, state.params.kposI, state.params.kszI);
+    total += run(decoder_i, state.params.kposI, state.params.kszI, deep_i);
   }
   if ((submodes & (1 << ProfileE::bit_index)) != 0) {
-    total += run(decoder_e, state.params.kposE, state.params.kszE);
+    total += run(decoder_e, state.params.kposE, state.params.kszE, deep_e);
   }
   if ((submodes & (1 << ProfileC::bit_index)) != 0) {
-    total += run(decoder_c, state.params.kposC, state.params.kszC);
+    total += run(decoder_c, state.params.kposC, state.params.kszC, deep_c);
   }
   if ((submodes & (1 << ProfileB::bit_index)) != 0) {
-    total += run(decoder_b, state.params.kposB, state.params.kszB);
+    total += run(decoder_b, state.params.kposB, state.params.kszB, deep_b);
   }
   if ((submodes & (1 << ProfileA::bit_index)) != 0) {
-    total += run(decoder_a, state.params.kposA, state.params.kszA);
+    total += run(decoder_a, state.params.kposA, state.params.kszA, deep_a);
+  }
+
+  // Optional deep acquisition gets only the time left after every established
+  // decode path, including tracking in later submodes.
+  if (state.params.deep_sync) {
+    auto finish = [&](auto& decoder, DeepSyncWindow& window) {
+      if (window.count > 0) total += decoder->deep_sync(state, window, emit, control);
+    };
+    finish(decoder_i, deep_i);
+    finish(decoder_e, deep_e);
+    finish(decoder_c, deep_c);
+    finish(decoder_b, deep_b);
+    finish(decoder_a, deep_a);
   }
 
   control.is_canceled();

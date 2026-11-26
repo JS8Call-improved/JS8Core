@@ -203,6 +203,7 @@ class Js8EngineImpl final : public Js8Engine {
     ring_.params.nfqso = 1500;
     ring_.params.symbol_tracking = config_.symbol_tracking;
     ring_.params.tracked_sic = config_.tracked_sic;
+    ring_.params.deep_sync = config_.deep_sync;
 
     align_ring(aligned_now());
 

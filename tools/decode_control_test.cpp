@@ -139,6 +139,7 @@ int main() {
   osd_state.params.nfb = 1740;
   osd_state.params.syncStats = true;
   osd_state.params.symbol_tracking = SymbolTracking::Disabled;
+  osd_state.params.deep_sync = false;
   osd_state.samples = test::render_tracking_audio(
       std::array{test::TrackingWaveform(weak), test::TrackingWaveform(strong)}, 12000, 48000);
   // Use the generator's bits directly so the noise is identical across standard libraries.

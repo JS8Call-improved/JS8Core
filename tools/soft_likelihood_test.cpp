@@ -45,6 +45,7 @@ bool decodes_soft_fixture() {
   state.params.nsubmodes = 1 << 4;
   state.params.kszI = kWindow;
   state.params.symbol_tracking = SymbolTracking::Disabled;
+  state.params.deep_sync = false;
   DecodeControl control;
   control.optional_allowed = [] { return false; };  // No OSD recovery.
   bool found = false;

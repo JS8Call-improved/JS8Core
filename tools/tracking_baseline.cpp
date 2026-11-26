@@ -181,6 +181,7 @@ int main(int argc, char** argv) {
         // independent of the library's enabled configuration defaults.
         state.params.symbol_tracking = SymbolTracking::Disabled;
         state.params.tracked_sic = false;
+        state.params.deep_sync = false;  // Isolate tracking and tracked cancellation.
         double const noise = impairment.noise_sigma;
         state.samples = test::render_tracking_audio(waves, rate, mode.tx_seconds * rate,
                                                     noise, 0x51a700u + seed);

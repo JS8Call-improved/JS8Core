@@ -31,7 +31,7 @@ jobs:
           js8core js8core-version-test js8core-crc-test js8core-varicode-test js8core-policy-test js8core-clock-math-test
           verify_jsc_roundtrip js8core-vox-test js8core-fractional-rx-test
           js8core-tracking-waveform-test js8core-tracking-baseline
-          js8core-soft-likelihood-test
+          js8core-soft-likelihood-test js8core-coherent-costas-test
           js8core-symbol-tracking-test
           js8core-tracked-extraction-test
           js8core-tracked-reference-test
@@ -53,14 +53,14 @@ jobs:
         run: |
           ./build/js8core-wav-decode-test A build/wav-fixtures/A_*.wav
           ./build/js8core-wav-decode-test E build/wav-fixtures/E_*.wav
-      - name: Verify optional tracking preserves pinned WAV results
+      - name: Verify optional tracking and deep sync preserve pinned WAV results
         run: |
           ./build/js8core-wav-decode-test --tracking both A build/wav-fixtures/A_*.wav
           ./build/js8core-wav-decode-test --tracking both E build/wav-fixtures/E_*.wav
           ./build/js8core-wav-decode-test --tracking both --wrap A build/wav-fixtures/A_*.wav
           ./build/js8core-wav-decode-test --tracking both --wrap E build/wav-fixtures/E_*.wav
-          ./build/js8core-wav-decode-test --tracking both --tracked-sic A build/wav-fixtures/A_*.wav
-          ./build/js8core-wav-decode-test --tracking both --tracked-sic E build/wav-fixtures/E_*.wav
+          ./build/js8core-wav-decode-test --tracking both --tracked-sic --deep-sync A build/wav-fixtures/A_*.wav
+          ./build/js8core-wav-decode-test --tracking both --tracked-sic --deep-sync E build/wav-fixtures/E_*.wav
       - name: Verify installed package
         run: |
           cmake --install build --prefix "$PWD/stage"

@@ -210,7 +210,7 @@ tracking is `Both`. It defaults to true and requires complete
 frequency/timing fits, CRC validation and a guarded energy-reducing residual.
 New results from that residual have `Decoded::after_tracked_sic` set to true.
 
-Optional receive work (last-try OSD, symbol tracking, and tracked cancellation)
+Optional receive work (last-try OSD, symbol tracking, tracked cancellation, and deep sync)
 yields to queued captures and a monotonic deadline set by
 `EngineConfig::optional_decode_budget_ms` (250 ms by default). Zero disables
 optional work without disabling mandatory decoding. Last-try OSD can report
@@ -229,6 +229,15 @@ config.tracked_sic = false;
 
 Default enablement does not imply RF validation; the recorded-HF and load-testing
 limits in the validation document still apply.
+
+## Coherent Costas deep sync
+
+The bounded coherent Costas fallback runs by default after the established
+decoder finishes. It shares the optional decode budget and can report
+additional frames without using them for cancellation. Set
+`EngineConfig::deep_sync` (or `DecodeParams::deep_sync` for direct decoding)
+to `false` to disable it. See
+[the validation notes](docs/coherent-costas-validation.md) for the search and tests.
 
 ## Building and testing the independent package
 

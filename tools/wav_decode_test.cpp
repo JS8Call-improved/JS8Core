@@ -8,6 +8,7 @@
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "js8core/decoder.hpp"
@@ -115,7 +116,7 @@ bool same_frame(events::Decoded const& a, events::Decoded const& b) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  bool records = false, wrap = false, valid = true, tracked_sic = false;
+  bool records = false, wrap = false, valid = true, tracked_sic = false, deep_sync = false;
   SymbolTracking tracking = SymbolTracking::Disabled;
   int mode_arg = 1;
   while (mode_arg < argc && std::string_view(argv[mode_arg]).starts_with("--") && valid) {
@@ -123,6 +124,7 @@ int main(int argc, char** argv) {
     if (option == "--records") records = true;
     else if (option == "--wrap") wrap = true;
     else if (option == "--tracked-sic") tracked_sic = true;
+    else if (option == "--deep-sync") deep_sync = true;
     else if (option == "--tracking" && mode_arg < argc) {
       std::string_view value(argv[mode_arg++]);
       if (value == "disabled") tracking = SymbolTracking::Disabled;
@@ -137,7 +139,7 @@ int main(int argc, char** argv) {
        std::string_view(argv[mode_arg]) != "E" && std::string_view(argv[mode_arg]) != "e")) {
     std::fprintf(stderr,
                  "usage: %s [--records] [--tracking disabled|frequency|timing|both] "
-                 "[--wrap] [--tracked-sic] <mode A|E> <file.wav>...\n", argv[0]);
+                 "[--wrap] [--tracked-sic] [--deep-sync] <mode A|E> <file.wav>...\n", argv[0]);
     return 2;
   }
 
@@ -157,6 +159,7 @@ int main(int argc, char** argv) {
     // production defaults. Explicit CLI switches select the candidate path.
     state.params.symbol_tracking = SymbolTracking::Disabled;
     state.params.tracked_sic = false;
+    state.params.deep_sync = false;
     state.samples.assign(static_cast<std::size_t>(kJs8NtMax * kJs8RxSampleRate), 0);
     // Reject oversized input rather than writing beyond the 60-second ring.
     if (samples.size() > state.samples.size()) {
@@ -241,6 +244,29 @@ int main(int argc, char** argv) {
       ++failures;
     }
     if (tracked_sic) std::fprintf(stderr, "SIC\t%s\t%zu\n", basename.c_str(), cancellations);
+    if (deep_sync) {
+      auto const previous_cancellations = cancellations;
+      auto const before = std::move(results);
+      results.clear();
+      state.params.deep_sync = true;
+      double const deep_ms = run(results);
+      bool preserved = cancellations == previous_cancellations && results.size() >= before.size() &&
+          std::equal(before.begin(), before.end(), results.begin(), same_frame);
+      for (std::size_t i = before.size(); preserved && i < results.size(); ++i) {
+        auto const& d = results[i];
+        preserved = !d.tracking_used && !d.after_tracked_sic &&
+            std::none_of(results.begin(), results.begin() + i, [&](auto const& prior) {
+              return d.type == prior.type && d.data == prior.data;
+            });
+      }
+      if (!preserved) {
+        std::fprintf(stderr, "%s: deep sync changed existing results or emitted a duplicate\n",
+                     basename.c_str());
+        ++failures;
+      }
+      std::fprintf(stderr, "DEEP\t%s\t%zu\t%zu\t%.3f\t%.3f\n",
+                   basename.c_str(), before.size(), results.size(), enabled_ms, deep_ms);
+    }
     int const count = static_cast<int>(baseline.size());
     for (auto const& decoded : results) {
       if (records) {

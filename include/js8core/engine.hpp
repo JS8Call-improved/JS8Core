@@ -101,6 +101,8 @@ struct EngineConfig {
   // Monotonic wall-time allowance from enqueue through optional work. Zero
   // disables optional work; mandatory decoding is not subject to this budget.
   int optional_decode_budget_ms = 250;
+  // Report-only coherent Costas acquisition fallback, under the optional budget.
+  bool deep_sync = true;
 };
 
 // Request to encode and transmit a user message.

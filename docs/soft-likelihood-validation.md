@@ -64,7 +64,7 @@ the input samples to detect differences in synthesis.
 
 The CPU figures exclude waveform synthesis and initial allocation, but
 include the full decoder, including any change in subsequent work after
-pass 2. Tracking is off and the offline OSD fallback remains available.
+pass 2. Tracking and deep sync are off and the offline OSD fallback remains available.
 These trials do not measure streaming queue pressure or establish an on-air
 false-decode rate. Use the pinned WAV parity tests alongside the synthetic
 benchmark when changing the demapper.
