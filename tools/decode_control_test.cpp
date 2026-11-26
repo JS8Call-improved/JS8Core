@@ -1,5 +1,6 @@
 #include "tracking_waveform.hpp"
 #include "js8core/decoder.hpp"
+#include "src/decoder/frame_history.hpp"
 #include "src/decoder/symbol_tracking.hpp"
 #include "src/decoder/tracked_reference.hpp"
 
@@ -18,6 +19,30 @@ int main() {
     ++checks;
     if (!okay) { std::fprintf(stderr, "FAIL control: %s\n", name); ++failures; }
   };
+  decoder::Frame const candidate{4, "Ux2zqX++++++"};
+  decoder::Frame const other_type{5, candidate.text};
+  decoder::Frame const other_text{candidate.type, "HELLO-WORLD-"};
+  using decoder::ReportedFrame;
+  using decoder::different_frame_near;
+  check(different_frame_near(std::array{ReportedFrame{1503.0f, 0.05f, other_type}},
+                             1500.0f, 0.0f, candidate),
+        "same text with a different type conflicts at the nearby window boundary");
+  check(different_frame_near(std::array{ReportedFrame{1500.0f, 0.0f, other_text}},
+                             1500.0f, 0.0f, candidate),
+        "same type with different text still conflicts");
+  check(!different_frame_near(std::array{ReportedFrame{1500.0f, 0.0f, other_type},
+                                         ReportedFrame{1501.0f, 0.01f, candidate}},
+                              1500.0f, 0.0f, candidate),
+        "an exact nearby frame match overrides a conflict");
+  check(!different_frame_near(std::array{ReportedFrame{1504.0f, 0.0f, other_type},
+                                         ReportedFrame{1500.0f, 0.051f, other_type}},
+                              1500.0f, 0.0f, candidate),
+        "reports outside either nearby limit do not conflict");
+  check(different_frame_near(std::array{ReportedFrame{1500.0f, 0.0f, other_type},
+                                        ReportedFrame{1504.0f, 0.0f, candidate}},
+                             1500.0f, 0.0f, candidate),
+        "an exact match outside the nearby window does not override a conflict");
+
   test::TrackingSignal signal;
   signal.symbol_seconds = 384.0 / 12000;
   signal.start_seconds = 0.113037;

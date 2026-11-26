@@ -17,7 +17,8 @@ uncover a weaker signal by cancellation. A frame independently recovered by
 belief propagation is still eligible for subtraction.
 
 The historical measurements below used the original offline implementation,
-which allowed OSD subtraction and had no engine optional-work deadline.
+which allowed OSD subtraction, compared nearby frames by text alone, and had
+no engine optional-work deadline.
 
 ## What the last try does
 
@@ -45,9 +46,10 @@ which allowed OSD subtraction and had no engine optional-work deadline.
      subtracted either: on test audio with random frame text, the frames
      under it were then lost (Slow crowded set: 841 → 724 right frames with
      every pass checked, 841 → 1,007 with only the last try checked);
-   - a last-try answer is refused when a frame with different text was
-     already reported within 3 Hz and 0.05 s of it in this period: there it
-     is the leftover of that frame's subtraction read as a new frame.
+   - a last-try answer is refused when a frame with a different type or text
+     was already reported within 3 Hz and 0.05 s of it in this period, unless
+     an exact type-and-text match was also reported within that window. A
+     conflicting answer may be a subtraction residual misread as a new frame.
 
 Each last-try answer that reaches the CRC check has about a 1 in 4,096 chance
 of being a wrong frame that passes it (12-bit CRC). The checks above set how

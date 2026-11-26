@@ -14,7 +14,6 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -28,6 +27,7 @@
 #include "js8core/protocol/varicode.hpp"
 
 #include "decoder_tables.hpp"
+#include "frame_history.hpp"
 #include "ldpc.hpp"
 #include "symbol_tracking.hpp"
 #include "tracked_reference.hpp"
@@ -41,6 +41,7 @@ using namespace decoder::data;
 namespace {
 
 using namespace decoder::data;
+using decoder::Frame;
 
 using shape_t = std::vector<std::size_t>;
 using stride_t = std::vector<std::ptrdiff_t>;
@@ -69,12 +70,6 @@ constexpr float kOsdMaxDiscrepancy = 0.065f;
 // answer that reaches the CRC check has about a 1 in 4,096 chance of being
 // wrong; this gap cuts how many reach it.
 constexpr float kOsdMinRunnerUpGap = 0.0025f;
-// A last-try answer is refused when a different frame was already reported
-// within 3 Hz and 0.05 s of it in this period: it may be a subtraction
-// residual misread as a new frame.
-constexpr float kLastTryNearHz = 3.0f;
-constexpr float kLastTryNearSeconds = 0.05f;
-
 // A last-try answer that passes the CRC check is still refused when no
 // unpacker reads it: fast data when type bit 4 is set, else data, heartbeat,
 // compound or directed (JS8Call-improved's order). Such a frame would be shown
@@ -83,11 +78,10 @@ constexpr float kLastTryNearSeconds = 0.05f;
 // pass the CRC. Passes 1 to 5 keep every CRC-valid frame: a refused frame is
 // not subtracted either, and on test audio with random frame text the
 // frames under it were then lost.
-bool frame_readable(std::array<std::int8_t, 87> const& payload) {
+bool frame_readable(Frame const& candidate) {
   namespace vc = js8core::protocol::varicode;
-  std::string const frame = decoder::decode_message(payload);
-  int const type = (payload[72] << 2) | (payload[73] << 1) | payload[74];
-  if (type & 4) return !vc::unpack_fast_data_message(frame).empty();
+  auto const& frame = candidate.text;
+  if (candidate.type & 4) return !vc::unpack_fast_data_message(frame).empty();
   if (!vc::unpack_data_message(frame).empty()) return true;
   std::uint8_t kind = 0;
   std::uint8_t bits3 = 0;
@@ -138,25 +132,6 @@ struct Candidate {
   float score;
 };
 
-// A successfully decoded frame, keyed by type and text so that duplicate
-// detections can be merged.
-struct Frame {
-  int type;
-  std::string text;
-
-  bool operator==(Frame const&) const noexcept = default;
-
-  struct Hash {
-    std::size_t operator()(Frame const& frame) const noexcept {
-      std::size_t const a = std::hash<int>{}(frame.type);
-      std::size_t const b = std::hash<std::string>{}(frame.text);
-      return a ^ (b + 0x9e3779b9u + (a << 6) + (a >> 2));
-    }
-  };
-
-  using Map = std::unordered_map<Frame, int, Hash>;
-};
-
 // Per-submode decoder. All buffers are sized from the ModeProfile so that one
 // template instantiation handles each JS8 speed level.
 template <typename Mode>
@@ -191,28 +166,8 @@ class ChannelDecoder {
   std::vector<Candidate> find_candidates(int low_hz, int high_hz,
       DecodeControl const* control = nullptr, bool optional = false);
   float alignment_score(int offset, float frequency_delta);
-  // Frames reported so far in this period, with their position, for the
-  // last-try position check (see kLastTryNearHz).
-  struct Reported {
-    float frequency;
-    float offset;
-    std::string text;
-  };
-  std::vector<Reported> reported_;
-  // True when a frame with different text was reported within
-  // kLastTryNearHz and kLastTryNearSeconds, and no frame with this text was.
-  bool different_frame_near(float frequency, float offset, std::string const& text) const {
-    bool near = false;
-    for (auto const& frame : reported_) {
-      if (std::abs(frequency - frame.frequency) > kLastTryNearHz ||
-          std::abs(offset - frame.offset) > kLastTryNearSeconds) {
-        continue;
-      }
-      if (frame.text == text) return false;
-      near = true;
-    }
-    return near;
-  }
+  // Frames reported so far in this period, for the last-try position check.
+  std::vector<decoder::ReportedFrame> reported_;
   struct AttemptResult {
     Frame frame;
     bool subtracted;
@@ -985,8 +940,10 @@ auto ChannelDecoder<Mode>::attempt_decode(
     }
 
     if (!decoder::crc_ok(payload)) continue;
-    if (pass == 6 && (!frame_readable(payload) ||
-                      different_frame_near(frequency, offset, decoder::decode_message(payload)))) {
+    Frame frame{(payload[72] << 2) | (payload[73] << 1) | payload[74],
+                decoder::decode_message(payload)};
+    if (pass == 6 && (!frame_readable(frame) ||
+                      decoder::different_frame_near(reported_, frequency, offset, frame))) {
       continue;
     }
     if (pass == 6 ? !osd_allowed() : !allowed()) return std::nullopt;
@@ -1001,11 +958,8 @@ auto ChannelDecoder<Mode>::attempt_decode(
       emit(event);
     }
 
-    std::string text = decoder::decode_message(payload);
-    int const type = (payload[72] << 2) | (payload[73] << 1) | payload[74];
-
     std::array<int, kChannelSymbols> tones{};
-    legacy_encode(type, kCostas, text.data(), tones.data());
+    legacy_encode(frame.type, kCostas, frame.text.data(), tones.data());
 
     // OSD's best guess can pass the CRC by chance. Report it, but do not let
     // it change the residual seen by later ordinary or tracked attempts.
@@ -1025,7 +979,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
 
     // Never return a cancellation trajectory for a failed or non-CRC attempt.
     if (trajectory) *trajectory = fitted_trajectory;
-    return AttemptResult{Frame{type, std::move(text)}, subtracted};
+    return AttemptResult{std::move(frame), subtracted};
   }
 
   return std::nullopt;
@@ -1188,7 +1142,7 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
                            slot->first.type,
                            1.0f - hard_errors / 60.0f,
                            Mode::event_mode});
-      reported_.push_back({frequency, offset, slot->first.text});
+      reported_.push_back({frequency, offset, slot->first});
     }
 
     // Another pass is only useful if the audio changed. A BP decode can
