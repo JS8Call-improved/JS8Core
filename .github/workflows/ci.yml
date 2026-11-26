@@ -53,6 +53,8 @@ jobs:
         run: |
           ./build/js8core-wav-decode-test A build/wav-fixtures/A_*.wav
           ./build/js8core-wav-decode-test E build/wav-fixtures/E_*.wav
+      - name: Verify coherent likelihood WAV regression
+        run: ./build/js8core-coherent-likelihood-test build/wav-fixtures/A_*.wav
       - name: Verify optional tracking and deep sync preserve pinned WAV results
         run: |
           ./build/js8core-wav-decode-test --tracking both A build/wav-fixtures/A_*.wav
