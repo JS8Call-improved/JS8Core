@@ -39,6 +39,7 @@ add_library(js8core STATIC
   src/decoder/legacy_decoder.cpp
   src/decoder/ldpc.cpp
   src/decoder/soft_likelihood.cpp
+  src/decoder/soft_likelihoods.cpp
   src/decoder/symbol_tracking.cpp
   src/decoder/tracked_reference.cpp
   src/dsp/flatten.cpp
@@ -170,6 +171,9 @@ target_link_libraries(js8core-soft-likelihood-test PRIVATE js8core)
 
 add_executable(js8core-soft-likelihood-benchmark EXCLUDE_FROM_ALL tools/soft_likelihood_benchmark.cpp)
 target_link_libraries(js8core-soft-likelihood-benchmark PRIVATE js8core)
+add_executable(js8core-coherent-likelihood-test EXCLUDE_FROM_ALL tools/coherent_likelihood_test.cpp)
+target_include_directories(js8core-coherent-likelihood-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(js8core-coherent-likelihood-test PRIVATE js8core)
 
 add_executable(js8core-coherent-costas-test EXCLUDE_FROM_ALL tools/coherent_costas_test.cpp)
 target_include_directories(js8core-coherent-costas-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -220,6 +224,7 @@ if(BUILD_TESTING)
   add_test(NAME js8core-decoder-roundtrip COMMAND js8core-decoder-roundtrip-test)
   add_test(NAME js8core-soft-likelihood COMMAND js8core-soft-likelihood-test)
   add_test(NAME js8core-coherent-costas COMMAND js8core-coherent-costas-test)
+  add_test(NAME js8core-coherent-likelihood COMMAND js8core-coherent-likelihood-test)
   add_test(NAME js8core-tracking-waveform COMMAND js8core-tracking-waveform-test)
   add_test(NAME js8core-symbol-tracking COMMAND js8core-symbol-tracking-test)
   add_test(NAME js8core-tracked-extraction COMMAND js8core-tracked-extraction-test)

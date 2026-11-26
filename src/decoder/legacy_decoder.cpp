@@ -28,6 +28,7 @@
 
 #include "coherent_costas.hpp"
 #include "decode_quality.hpp"
+#include "soft_likelihoods.hpp"
 #include "decoder_tables.hpp"
 #include "frame_history.hpp"
 #include "ldpc.hpp"
@@ -195,7 +196,8 @@ class ChannelDecoder {
       int& hard_errors, float& snr, int& rescue_budget, EventEmitter emit,
       SymbolTracking tracking = SymbolTracking::Disabled, int received_samples = 0,
       std::optional<decoder::TrackedTrajectory>* trajectory = nullptr,
-      DecodeControl const* control = nullptr, decoder::CoherentCostasPeak const* deep = nullptr);
+      DecodeControl const* control = nullptr, decoder::CoherentCostasPeak const* deep = nullptr,
+      bool coherent_likelihood = false);
 
   // --- Signal reconstruction -----------------------------------------------
 
@@ -664,7 +666,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
     int& hard_errors, float& snr, int& rescue_budget, EventEmitter emit,
     SymbolTracking tracking, int received_samples,
     std::optional<decoder::TrackedTrajectory>* trajectory, DecodeControl const* control,
-    decoder::CoherentCostasPeak const* deep)
+    decoder::CoherentCostasPeak const* deep, bool coherent_likelihood)
     -> std::optional<AttemptResult> {
   if (trajectory) trajectory->reset();
   auto allowed = [&] {
@@ -747,6 +749,8 @@ auto ChannelDecoder<Mode>::attempt_decode(
   float const sync = alignment_score(origin, 0.0f, demodulation_limit);
 
   std::array<std::array<float, kChannelSymbols>, kToneRows> tone_power{};
+  // Coherent data-likelihood observations (filled only when enabled).
+  decoder::ToneObservations observations;
 
   std::vector<std::complex<float>> tracked_symbols;
   std::optional<decoder::TrackedTrajectory> fitted_trajectory;
@@ -801,6 +805,11 @@ auto ChannelDecoder<Mode>::attempt_decode(
                           shape_t{0}, true, symbol_fft_.data(),
                           symbol_fft_.data(), 1.0f, 1);
 
+    if (coherent_likelihood) {
+      for (int row = 0; row < kToneRows; ++row)
+        observations[static_cast<std::size_t>(symbol)][static_cast<std::size_t>(row)] =
+            symbol_fft_[static_cast<std::size_t>(row)];
+    }
     for (int row = 0; row < kToneRows; ++row) {
       tone_power[static_cast<std::size_t>(row)][static_cast<std::size_t>(symbol)] =
           std::abs(symbol_fft_[static_cast<std::size_t>(row)]) / 1000.0f;
@@ -890,6 +899,19 @@ auto ChannelDecoder<Mode>::attempt_decode(
 
   auto pass_two_llrs = [&] {
 #if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
+    if (coherent_likelihood) {
+      // Coherent data-likelihood soft symbols: per-tone noise, bounded pilot
+      // channel fit, then Rician fallback when the fit fails. Uses the captured
+      // per-symbol complex bins and produces LLRs in code-bit order.
+      if (auto model = decoder::estimate_disturbance(observations, kCostas, true, control)) {
+        if (auto channel = decoder::estimate_pilot_channel(observations, kCostas, *model, control)) {
+          if (auto coherent = decoder::make_soft_likelihoods(observations, *model, &*channel, control))
+            return *coherent;
+        } else if (auto soft = decoder::make_soft_likelihoods(observations, *model, nullptr, control)) {
+          return *soft;
+        }
+      }
+    }
     if (tracking == SymbolTracking::Disabled) {
       int const available = std::min(demodulation_limit, received_samples / Mode::downsample_factor);
       if (auto soft = decoder::soft_frame_llrs(tone_power, kCostas, best_time,
@@ -1146,7 +1168,8 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
 
       auto result = attempt_decode(data.params.syncStats, subtract, frequency,
                                    offset, hard_errors, snr, rescue_budget, emit,
-                                   SymbolTracking::Disabled, count, nullptr, &control);
+                                   SymbolTracking::Disabled, count, nullptr, &control, nullptr,
+                                   data.params.coherent_likelihood);
       if (!result) continue;
       changed |= result->subtracted;
 
@@ -1212,7 +1235,7 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
                                        hard_errors, snr, tracking_rescue_budget, emit,
                                        data.params.symbol_tracking, count,
                                        data.params.tracked_sic && !after_cancellation ? &trajectory : nullptr,
-                                       &control);
+                                       &control, nullptr, data.params.coherent_likelihood);
           if (!result) continue;
           if (decoded.contains(result->frame)) break;
           int const rounded_snr = static_cast<int>(std::round(snr));
@@ -1316,7 +1339,7 @@ std::size_t ChannelDecoder<Mode>::deep_sync(dec_data const& data, DeepSyncWindow
     int hard_errors = -1, no_rescue = 0;
     auto frame = attempt_decode(false, false, frequency, offset, hard_errors, snr, no_rescue,
                                  emit, SymbolTracking::Disabled, window.count, nullptr, &control,
-                                 &hypothesis.peak);
+                                 &hypothesis.peak, data.params.coherent_likelihood);
     if (!frame) continue;
     if (!control.allow_optional()) break;
     int const rounded_snr = static_cast<int>(std::round(snr));
