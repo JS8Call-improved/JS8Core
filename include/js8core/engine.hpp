@@ -107,6 +107,9 @@ struct EngineConfig {
   bool coherent_likelihood = true;
   // Try adaptive subtraction after an ordinary frame has passed CRC.
   bool adaptive_sic = true;
+  // Optional near-miss retries after the established decoder attempts.
+  bool ldpc_rescue = true;
+  bool aided_redemodulation = true;
 };
 
 // Request to encode and transmit a user message.

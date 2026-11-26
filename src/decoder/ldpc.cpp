@@ -123,7 +123,8 @@ std::string decode_message(std::array<std::int8_t, 87> const& payload) {
 int belief_propagation(std::array<float, 174> const& llr,
                        std::array<std::int8_t, 87>& payload,
                        std::array<std::int8_t, 174>& codeword,
-                       int max_iterations, bool early_abort) {
+                        int max_iterations, bool early_abort,
+                        BpNearMiss* near_miss, DecodeControl const* control) {
   using namespace data;
 
   // Messages travelling from bits to checks, and from checks to bits.
@@ -131,12 +132,17 @@ int belief_propagation(std::array<float, 174> const& llr,
   std::array<std::array<float, kMaxCheckDegree>, kParityBits> check_to_bit{};
   std::array<std::array<float, kMaxCheckDegree>, kParityBits> check_tanh{};
   std::array<float, kCodeLength> posterior{};
-  std::array<int, kParityBits> syndrome{};
+  BpNearMiss best;
+  if (near_miss) best.failed_checks = near_miss->failed_checks;
+  auto remember = [&] {
+    if (near_miss && best.failed_checks < near_miss->failed_checks) *near_miss = best;
+  };
 
   int stalled = 0;
   int previous_failures = 0;
 
   for (int iteration = 0; iteration <= max_iterations; ++iteration) {
+    if (control && !control->allow_optional()) return -1;
     // Posterior log-likelihood ratio for every coded bit.
     for (int bit = 0; bit < kCodeLength; ++bit) {
       float value = llr[static_cast<std::size_t>(bit)];
@@ -159,11 +165,12 @@ int belief_propagation(std::array<float, 174> const& llr,
       for (int j = 0; j < node.count; ++j) {
         parity += codeword[static_cast<std::size_t>(node.bits[j])];
       }
-      syndrome[static_cast<std::size_t>(check)] = parity;
       if ((parity & 1) != 0) ++failed_checks;
     }
 
     if (failed_checks == 0) {
+      if (control && !control->allow_optional()) return -1;
+      remember();
       std::copy(codeword.begin() + kParityBits, codeword.end(),
                 payload.begin());
 
@@ -175,10 +182,11 @@ int belief_propagation(std::array<float, 174> const& llr,
       return errors;
     }
 
+    if (near_miss && failed_checks < best.failed_checks) best = {failed_checks, codeword};
     if (iteration > 0) {
       int const delta = failed_checks - previous_failures;
       stalled = delta < 0 ? 0 : stalled + 1;
-      if (early_abort && stalled >= 5 && iteration >= 10 && failed_checks > 15) return -1;
+      if (early_abort && stalled >= 5 && iteration >= 10 && failed_checks > 15) break;
     }
     previous_failures = failed_checks;
 
@@ -236,6 +244,7 @@ int belief_propagation(std::array<float, 174> const& llr,
     }
   }
 
+  if (!control || control->allow_optional()) remember();
   return -1;
 }
 

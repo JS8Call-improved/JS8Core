@@ -43,6 +43,9 @@ struct DecodeParams {
   bool coherent_likelihood = true;
   // Try adaptive subtraction of validated ordinary frames under the optional budget.
   bool adaptive_sic = true;
+  // Optional near-miss retries after the established decoder attempts.
+  bool ldpc_rescue = true;
+  bool aided_redemodulation = true;
 };
 
 struct DecodeState {

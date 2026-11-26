@@ -206,6 +206,8 @@ class Js8EngineImpl final : public Js8Engine {
     ring_.params.deep_sync = config_.deep_sync;
     ring_.params.coherent_likelihood = config_.coherent_likelihood;
     ring_.params.adaptive_sic = config_.adaptive_sic;
+    ring_.params.ldpc_rescue = config_.ldpc_rescue;
+    ring_.params.aided_redemodulation = config_.aided_redemodulation;
 
     align_ring(aligned_now());
 

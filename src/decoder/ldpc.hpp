@@ -24,13 +24,20 @@ bool crc_ok(std::array<std::int8_t, 87> const& payload);
 // Reconstructs the twelve-character frame text from a CRC-valid payload.
 std::string decode_message(std::array<std::int8_t, 87> const& payload);
 
+struct BpNearMiss {
+  int failed_checks = 88;
+  std::array<std::int8_t, 174> bits{};
+};
+
 // Sum-product belief propagation over the 174/87 LDPC code. Returns the number
 // of hard-decision disagreements for a valid codeword, or -1 when decoding
-// does not converge.
+// does not converge. Optionally retain the best nonzero syndrome across runs.
+// A canceled run does not update the caller's near miss.
 int belief_propagation(std::array<float, 174> const& llr,
                        std::array<std::int8_t, 87>& payload,
                        std::array<std::int8_t, 174>& codeword,
-                       int max_iterations = 60, bool early_abort = true);
+                        int max_iterations = 60, bool early_abort = true,
+                        BpNearMiss* near_miss = nullptr, DecodeControl const* control = nullptr);
 
 // Ordered statistics decoding of the 174/87 code with up to `order` (0 to 2)
 // flipped reliable bits. Always returns the closest candidate found: the

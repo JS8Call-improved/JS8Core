@@ -213,6 +213,17 @@ ordinary subtraction. Set
 `EngineConfig::adaptive_sic` (or `DecodeParams::adaptive_sic` for direct decoding)
 to `false` to opt out. This setting is independent of tracked cancellation.
 
+## LDPC near-miss recovery
+
+Two budgeted retries are enabled by default after the ordinary decode passes and
+last-try OSD. `EngineConfig::ldpc_rescue` retries the input that came closest to
+satisfying the LDPC parity checks, using a small set of likelihood scales. For closer near
+misses, `EngineConfig::aided_redemodulation` uses tentative tones to refine timing
+and carrier alignment, checks the adjustment against the Costas pilots, and
+decodes fresh tone measurements. Aided results must pass CRC and are report-only.
+Set either option to `false` to disable that retry. The same options are
+available on `DecodeParams` for direct decoder calls.
+
 ## Experimental symbol tracking
 
 Per-symbol frequency and timing corrections are enabled by default as a receive
@@ -226,8 +237,8 @@ tracking is `Both`. It defaults to true and requires complete
 frequency/timing fits, CRC validation and a guarded energy-reducing residual.
 New results from that residual have `Decoded::after_tracked_sic` set to true.
 
-Optional receive work (last-try OSD, coherent likelihoods, adaptive cancellation,
-symbol tracking, tracked cancellation, and deep sync)
+Optional receive work (last-try OSD, near-miss retries, coherent likelihoods,
+adaptive cancellation, symbol tracking, tracked cancellation, and deep sync)
 yields to queued captures and a monotonic deadline set by
 `EngineConfig::optional_decode_budget_ms` (250 ms by default). Zero disables
 optional work without disabling mandatory decoding. Last-try OSD can report
