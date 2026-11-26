@@ -105,6 +105,8 @@ struct EngineConfig {
   bool deep_sync = true;
   // Try coherent data likelihoods under the optional decode budget.
   bool coherent_likelihood = true;
+  // Try adaptive subtraction after an ordinary frame has passed CRC.
+  bool adaptive_sic = true;
 };
 
 // Request to encode and transmit a user message.

@@ -117,6 +117,7 @@ bool same_frame(events::Decoded const& a, events::Decoded const& b) {
 
 int main(int argc, char** argv) {
   bool records = false, wrap = false, valid = true, tracked_sic = false, deep_sync = false;
+  bool adaptive_sic = false;
   SymbolTracking tracking = SymbolTracking::Disabled;
   int mode_arg = 1;
   while (mode_arg < argc && std::string_view(argv[mode_arg]).starts_with("--") && valid) {
@@ -124,6 +125,7 @@ int main(int argc, char** argv) {
     if (option == "--records") records = true;
     else if (option == "--wrap") wrap = true;
     else if (option == "--tracked-sic") tracked_sic = true;
+    else if (option == "--adaptive-sic") adaptive_sic = true;
     else if (option == "--deep-sync") deep_sync = true;
     else if (option == "--tracking" && mode_arg < argc) {
       std::string_view value(argv[mode_arg++]);
@@ -139,7 +141,8 @@ int main(int argc, char** argv) {
        std::string_view(argv[mode_arg]) != "E" && std::string_view(argv[mode_arg]) != "e")) {
     std::fprintf(stderr,
                  "usage: %s [--records] [--tracking disabled|frequency|timing|both] "
-                 "[--wrap] [--tracked-sic] [--deep-sync] <mode A|E> <file.wav>...\n", argv[0]);
+                 "[--wrap] [--tracked-sic] [--adaptive-sic] [--deep-sync] "
+                 "<mode A|E> <file.wav>...\n", argv[0]);
     return 2;
   }
 
@@ -159,6 +162,7 @@ int main(int argc, char** argv) {
     // production defaults. Explicit CLI switches select the candidate path.
     state.params.symbol_tracking = SymbolTracking::Disabled;
     state.params.tracked_sic = false;
+    state.params.adaptive_sic = false;
     state.params.deep_sync = false;
     state.samples.assign(static_cast<std::size_t>(kJs8NtMax * kJs8RxSampleRate), 0);
     // Reject oversized input rather than writing beyond the 60-second ring.
@@ -244,6 +248,15 @@ int main(int argc, char** argv) {
       ++failures;
     }
     if (tracked_sic) std::fprintf(stderr, "SIC\t%s\t%zu\n", basename.c_str(), cancellations);
+    if (adaptive_sic) {
+      auto const previous_count = results.size();
+      state.params.adaptive_sic = true;
+      results.clear();
+      double const adaptive_ms = run(results);
+      std::fprintf(stderr, "ADAPTIVE\t%s\t%zu\t%zu\t%.3f\t%.3f\n",
+                   basename.c_str(), previous_count, results.size(), enabled_ms, adaptive_ms);
+      enabled_ms = adaptive_ms;
+    }
     if (deep_sync) {
       auto const previous_cancellations = cancellations;
       auto const before = std::move(results);

@@ -200,6 +200,19 @@ Build with `-DJS8CORE_SOFT_DEMAPPER=OFF` to disable both soft demappers. See
 [the validation notes](docs/soft-likelihood-validation.md) for the noncoherent
 model and its paired benchmark results.
 
+## Adaptive interference cancellation
+
+Adaptive interference cancellation is enabled by default. After a CRC-validated
+ordinary decode, JS8Core can refine the reconstructed
+frame's timing, carrier, and drift and fit a channel that follows slow fading.
+It first tries ordinary FFT subtraction and skips refinement when the decoded
+signal is already well suppressed. It uses the adaptive residual only if it
+leaves measurably less of the decoded waveform than ordinary FFT subtraction.
+Clipped frames and work that exceeds the optional decode budget fall back to
+ordinary subtraction. Set
+`EngineConfig::adaptive_sic` (or `DecodeParams::adaptive_sic` for direct decoding)
+to `false` to opt out. This setting is independent of tracked cancellation.
+
 ## Experimental symbol tracking
 
 Per-symbol frequency and timing corrections are enabled by default as a receive
@@ -213,7 +226,8 @@ tracking is `Both`. It defaults to true and requires complete
 frequency/timing fits, CRC validation and a guarded energy-reducing residual.
 New results from that residual have `Decoded::after_tracked_sic` set to true.
 
-Optional receive work (last-try OSD, symbol tracking, tracked cancellation, and deep sync)
+Optional receive work (last-try OSD, coherent likelihoods, adaptive cancellation,
+symbol tracking, tracked cancellation, and deep sync)
 yields to queued captures and a monotonic deadline set by
 `EngineConfig::optional_decode_budget_ms` (250 ms by default). Zero disables
 optional work without disabling mandatory decoding. Last-try OSD can report

@@ -205,6 +205,7 @@ class Js8EngineImpl final : public Js8Engine {
     ring_.params.tracked_sic = config_.tracked_sic;
     ring_.params.deep_sync = config_.deep_sync;
     ring_.params.coherent_likelihood = config_.coherent_likelihood;
+    ring_.params.adaptive_sic = config_.adaptive_sic;
 
     align_ring(aligned_now());
 

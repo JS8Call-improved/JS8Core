@@ -1,14 +1,21 @@
 #include "tracking_waveform.hpp"
+#include "src/decoder/adaptive_sic.hpp"
 #include "src/decoder/tracked_reference.hpp"
 
 #include <cstdio>
 #include <limits>
 
+#include "js8core/decoder.hpp"
+#include "js8core/engine.hpp"
+#include "js8core/protocol/costas.hpp"
 #include "js8core/protocol/submode.hpp"
 
 using namespace js8core;
 
 namespace {
+static_assert(EngineConfig{}.adaptive_sic);
+static_assert(DecodeParams{}.adaptive_sic);
+
 decoder::TrackedTrajectory truth(test::TrackingSignal const& signal, int sps) {
   constexpr double rate = 12000.0;
   decoder::TrackedTrajectory t;
@@ -172,6 +179,102 @@ int main() {
   reference[0] = {1.0f, 0.0f};
   reference[100] = {};
   check(decoder::cancel_tracked_reference(audio, reference, 32).residual.empty(), "reference support holes rejected");
+
+  // A strong station's timing and frequency drift leave enough residual
+  // after FFT subtraction to hide a weaker station on the same frequency.
+  constexpr int rate = kJs8RxSampleRate, count = 4 * rate, sps = 384;
+  constexpr char strong_frame[] = "Ux2zqX++++++", weak_frame[] = "HELLO-WORLD-";
+  auto const& costas = protocol::costas(protocol::CostasType::Modified);
+  test::TrackingSignal strong;
+  strong.symbol_seconds = static_cast<double>(sps) / rate;
+  strong.start_seconds = 0.1217;
+  strong.amplitude = 10000.0;
+  strong.phase_radians = 0.31;
+  strong.frequency_slope_hz_s = 0.1;
+  strong.clock_ppm = 190.0;
+  strong.fade_depth = 0.5;
+  legacy_encode(4, costas, strong_frame, strong.tones.data());
+  test::TrackingSignal weak;
+  weak.symbol_seconds = strong.symbol_seconds;
+  weak.start_seconds = strong.start_seconds + 0.039;
+  weak.amplitude = 150.0;
+  weak.phase_radians = 1.2;
+  legacy_encode(2, costas, weak_frame, weak.tones.data());
+  auto const pcm = test::render_tracking_audio(
+      std::array{test::TrackingWaveform(strong), test::TrackingWaveform(weak)}, rate, count);
+  auto const weak_only = test::render_tracking_audio(
+      std::array{test::TrackingWaveform(weak)}, rate, count);
+
+  DecodeState state;
+  state.samples.assign(pcm.begin(), pcm.end());
+  state.samples.resize(kJs8NtMax * rate);
+  state.params.nfa = 1450;
+  state.params.nfb = 1600;
+  state.params.nfqso = 1500;
+  state.params.nsubmodes = 1 << 4;
+  state.params.kszI = count;
+  state.params.symbol_tracking = SymbolTracking::Disabled;
+  state.params.deep_sync = false;
+  auto decode_frames = [&](DecodeControl const& control = {}) {
+    std::vector<std::pair<int, std::string>> frames;
+    decode_with_control(state, [&](events::Variant const& event) {
+      if (auto const* frame = std::get_if<events::Decoded>(&event))
+        frames.emplace_back(frame->type, frame->data);
+    }, control);
+    return frames;
+  };
+  std::vector<std::pair<int, std::string>> const both = {{4, strong_frame}, {2, weak_frame}};
+  auto const adaptive = decode_frames();
+  check(adaptive == both, "default adaptive SIC recovers the same-frequency weak frame");
+  state.params.adaptive_sic = false;
+  auto const baseline = decode_frames();
+  check(baseline == decltype(both){{4, strong_frame}}, "fixed SIC only recovers the strong frame");
+  state.params.adaptive_sic = true;
+  DecodeControl denied;
+  denied.optional_allowed = [] { return false; };
+  check(decode_frames(denied) == baseline, "denied adaptive SIC falls back to fixed subtraction");
+  state.params.kposI = (kJs8NtMax - 1) * rate;
+  std::rotate(state.samples.begin(), state.samples.begin() + rate, state.samples.end());
+  check(decode_frames() == both, "adaptive cancellation works across a wrapped capture");
+
+  audio.assign(pcm.begin(), pcm.end());
+  decoder::TrackedTrajectory seed{rate, sps, 1440, 1500};
+  auto const fixed_reference = decoder::make_tracked_reference(strong.tones, seed, count);
+  auto const fixed = decoder::cancel_tracked_reference(audio, fixed_reference, sps);
+  constexpr int frame_samples = kJs8NumSymbols * sps;
+  auto const aligned_reference = std::span(fixed_reference).subspan(1440, frame_samples);
+  std::vector<float> aligned_audio(frame_samples), aligned_residual(frame_samples);
+  for (int i = 0; i < frame_samples; ++i) {
+    aligned_audio[i] = 4000.0f * aligned_reference[i].imag();
+    aligned_residual[i] = 30.0f * aligned_reference[i].imag();
+  }
+  check(decoder::fixed_cancellation_sufficient(aligned_audio, aligned_residual, aligned_reference, sps),
+        "strong ordinary suppression skips adaptive refinement");
+  check(!fixed.residual.empty() && !decoder::fixed_cancellation_sufficient(
+            std::span(audio).subspan(1440, frame_samples),
+            std::span(fixed.residual).subspan(1440, frame_samples), aligned_reference, sps),
+        "drifting overlap still warrants refinement");
+  std::fill(aligned_residual.begin(), aligned_residual.end(), 1500.0f);
+  check(!decoder::fixed_cancellation_sufficient(aligned_audio, aligned_residual, aligned_reference, sps),
+        "a weak matched residual alone does not hide substantial unmatched energy");
+  auto const improved = decoder::propose_adaptive_cancellation(audio, strong.tones, seed, nullptr);
+  check(!fixed.residual.empty() && !improved.residual.empty() &&
+        squared_error(improved.residual, weak_only) < 0.25 * squared_error(fixed.residual, weak_only),
+        "reference refinement reduces strong-waveform error under clock and carrier drift");
+  check(decoder::improves_cancellation(audio, fixed.residual, improved, nullptr),
+        "matched residual comparison accepts the better reconstruction");
+  check(!decoder::improves_cancellation(audio, improved.residual, improved, nullptr),
+        "adaptive candidate tied with baseline is not selected");
+  check(decoder::propose_adaptive_cancellation(
+            std::span(audio).first(1440 + 79 * sps - 1), strong.tones, seed, nullptr).residual.empty(),
+        "incomplete frame stays on the fixed path");
+  int probes = 0;
+  DecodeControl expires;
+  expires.optional_allowed = [&] { return ++probes < 10; };
+  check(decoder::propose_adaptive_cancellation(audio, strong.tones, seed, &expires).residual.empty() &&
+        probes >= 10 && std::equal(audio.begin(), audio.end(), pcm.begin()),
+        "interrupted adaptive fitting leaves the audio untouched");
+
   std::printf("%d tracked reconstruction/cancellation checks, %d failures\n", checks, failures);
   return failures ? 1 : 0;
 }

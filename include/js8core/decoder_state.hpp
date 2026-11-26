@@ -41,6 +41,8 @@ struct DecodeParams {
   bool deep_sync = true;
   // Try coherent data likelihoods under the optional decode budget.
   bool coherent_likelihood = true;
+  // Try adaptive subtraction of validated ordinary frames under the optional budget.
+  bool adaptive_sic = true;
 };
 
 struct DecodeState {

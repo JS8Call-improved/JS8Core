@@ -42,6 +42,7 @@ add_library(js8core STATIC
   src/decoder/soft_likelihoods.cpp
   src/decoder/symbol_tracking.cpp
   src/decoder/tracked_reference.cpp
+  src/decoder/adaptive_sic.cpp
   src/dsp/flatten.cpp
   src/dsp/resampler.cpp
   src/tx/modulator.cpp

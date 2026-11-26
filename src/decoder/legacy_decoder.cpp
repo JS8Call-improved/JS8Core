@@ -26,6 +26,7 @@
 #include "js8core/protocol/costas.hpp"
 #include "js8core/protocol/varicode.hpp"
 
+#include "adaptive_sic.hpp"
 #include "coherent_costas.hpp"
 #include "decode_quality.hpp"
 #include "decoder_tables.hpp"
@@ -197,14 +198,17 @@ class ChannelDecoder {
       SymbolTracking tracking = SymbolTracking::Disabled, int received_samples = 0,
       std::optional<decoder::TrackedTrajectory>* trajectory = nullptr,
       DecodeControl const* control = nullptr, decoder::CoherentCostasPeak const* deep = nullptr,
-      bool coherent_likelihood = false);
+      bool coherent_likelihood = false, int* adaptive_budget = nullptr);
 
   // --- Signal reconstruction -----------------------------------------------
 
   std::vector<std::complex<float>> make_reference(std::array<int, kChannelSymbols> const& tones,
                                                   float frequency);
   bool subtract_reference(std::vector<std::complex<float>> const& reference,
-                          float offset);
+                          float offset, std::array<int, kChannelSymbols> const& tones,
+                          decoder::TrackedTrajectory const& seed, int received_samples,
+                          int* adaptive_budget,
+                          DecodeControl const* control);
 
   // --- Buffers --------------------------------------------------------------
 
@@ -666,7 +670,8 @@ auto ChannelDecoder<Mode>::attempt_decode(
     int& hard_errors, float& snr, int& rescue_budget, EventEmitter emit,
     SymbolTracking tracking, int received_samples,
     std::optional<decoder::TrackedTrajectory>* trajectory, DecodeControl const* control,
-    decoder::CoherentCostasPeak const* deep, [[maybe_unused]] bool coherent_likelihood)
+    decoder::CoherentCostasPeak const* deep, [[maybe_unused]] bool coherent_likelihood,
+    int* adaptive_budget)
     -> std::optional<AttemptResult> {
   if (trajectory) trajectory->reset();
   auto allowed = [&] {
@@ -1032,8 +1037,14 @@ auto ChannelDecoder<Mode>::attempt_decode(
 
     // OSD's best guess can pass the CRC by chance. Report it, but do not let
     // it change the residual seen by later ordinary or tracked attempts.
-    bool const subtracted = subtract && !deep && pass != 6 &&
-        subtract_reference(make_reference(tones, frequency), refined_offset);
+    bool subtracted = false;
+    if (subtract && !deep && pass != 6) {
+      // Keep the finalized origin in integer receive samples.
+      decoder::TrackedTrajectory const seed{12000.0, Mode::nsps,
+          static_cast<double>(best_time * Mode::downsample_factor), frequency};
+      subtracted = subtract_reference(make_reference(tones, frequency), refined_offset,
+                                      tones, seed, received_samples, adaptive_budget, control);
+    }
 
     float signal_power = 0.0f;
     for (std::size_t i = 0; i < tones.size(); ++i) {
@@ -1080,7 +1091,9 @@ std::vector<std::complex<float>> ChannelDecoder<Mode>::make_reference(
 
 template <typename Mode>
 bool ChannelDecoder<Mode>::subtract_reference(
-    std::vector<std::complex<float>> const& reference, float offset) {
+    std::vector<std::complex<float>> const& reference, float offset,
+    std::array<int, kChannelSymbols> const& tones, decoder::TrackedTrajectory const& seed,
+    int received_samples, int* adaptive_budget, DecodeControl const* control) {
   int const start = static_cast<int>(offset * 12000.0f);
   std::size_t const reference_start =
       start < 0 ? static_cast<std::size_t>(-start) : 0;
@@ -1115,10 +1128,35 @@ bool ChannelDecoder<Mode>::subtract_reference(
                         shape_t{0}, false, subtract_work_.data(),
                         subtract_work_.data(), 1.0f, 1);
 
-  for (std::size_t i = 0; i < count; ++i) {
-    samples_[signal_start + i] -=
+  auto const fixed_sample = [&](std::size_t i) {
+    return samples_[signal_start + i] -
         2.0f * std::real(subtract_work_[i] * reference[reference_start + i]);
+  };
+  auto const received = std::span<float const>(samples_).first(received_samples);
+  bool const complete = start >= 0 && signal_start + reference.size() <= received.size() &&
+      seed.epoch_sample >= 0.0 && seed.epoch_sample + reference.size() <= received.size();
+  if (complete && adaptive_budget && *adaptive_budget > 0 &&
+      (!control || control->allow_optional())) {
+    std::vector<float> fixed(count);
+    for (std::size_t i = 0; i < count; ++i) fixed[i] = fixed_sample(i);
+    if (!decoder::fixed_cancellation_sufficient(received.subspan(signal_start, count), fixed,
+                                                 reference, Mode::nsps) &&
+        (!control || control->allow_optional())) {
+      --*adaptive_budget;
+      auto const adaptive = decoder::propose_adaptive_cancellation(received, tones, seed, control);
+      if (!adaptive.residual.empty()) {
+        std::vector<float> baseline(received.begin(), received.end());
+        std::copy(fixed.begin(), fixed.end(), baseline.begin() + signal_start);
+        if (decoder::improves_cancellation(received, baseline, adaptive, control)) {
+          std::copy(adaptive.residual.begin(), adaptive.residual.end(), samples_.begin());
+          return true;
+        }
+      }
+    }
+    std::copy(fixed.begin(), fixed.end(), samples_.begin() + signal_start);
+    return true;
   }
+  for (std::size_t i = 0; i < count; ++i) samples_[signal_start + i] = fixed_sample(i);
   return true;
 }
 
@@ -1163,6 +1201,7 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
   Frame::Map decoded;
   reported_.clear();
   int rescue_budget = 32;
+  int adaptive_budget = 4;
 
   for (int pass = 1; pass <= 3; ++pass) {
     if (control.is_canceled()) break;
@@ -1194,7 +1233,8 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
       auto result = attempt_decode(data.params.syncStats, subtract, frequency,
                                    offset, hard_errors, snr, rescue_budget, emit,
                                    SymbolTracking::Disabled, count, nullptr, &control, nullptr,
-                                   data.params.coherent_likelihood);
+                                    data.params.coherent_likelihood,
+                                    data.params.adaptive_sic ? &adaptive_budget : nullptr);
       if (!result) continue;
       changed |= result->subtracted;
 

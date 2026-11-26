@@ -71,8 +71,8 @@ jobs:
       - name: Capture complete decode results from both implementations
         run: |
           set -euo pipefail
-          ./build/js8core-wav-decode-test --deep-sync --records A build/wav-fixtures/A_*.wav > build/js8core-a.tsv
-          ./build/js8core-wav-decode-test --deep-sync --records E build/wav-fixtures/E_*.wav > build/js8core-e.tsv
+          ./build/js8core-wav-decode-test --adaptive-sic --deep-sync --records A build/wav-fixtures/A_*.wav > build/js8core-a.tsv
+          ./build/js8core-wav-decode-test --adaptive-sic --deep-sync --records E build/wav-fixtures/E_*.wav > build/js8core-e.tsv
           ./build/desktop-reference/wav-reference A build/wav-fixtures/A_*.wav > build/desktop-a.tsv
           ./build/desktop-reference/wav-reference E build/wav-fixtures/E_*.wav > build/desktop-e.tsv
           cat build/js8core-a.tsv build/js8core-e.tsv > build/core-records.tsv
