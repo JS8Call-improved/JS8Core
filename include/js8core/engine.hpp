@@ -112,6 +112,8 @@ struct EngineConfig {
   bool aided_redemodulation = true;
   // Retry with tone- and time-dependent noise estimates.
   bool adaptive_whitening = true;
+  // Retry coherent decoding with a pilot-validated carrier drift estimate.
+  bool quadratic_phase = true;
 };
 
 // Request to encode and transmit a user message.

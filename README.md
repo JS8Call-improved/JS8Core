@@ -207,6 +207,14 @@ optional decode budget and reports CRC-valid frames without subtracting them
 from the audio. Set `EngineConfig::adaptive_whitening` or
 `DecodeParams::adaptive_whitening` to `false` to disable it independently.
 
+The quadratic phase retry is also enabled by default for ordinary candidates.
+It uses Costas pilots to estimate residual linear carrier drift and checks
+whether the resulting phase curve predicts held-out pilots better than the
+constant-frequency model. It runs under the optional decode budget after the
+existing attempts and reports CRC-valid recoveries without subtracting them
+from the audio. Set `EngineConfig::quadratic_phase` or
+`DecodeParams::quadratic_phase` to `false` to disable the retry.
+
 ## Adaptive interference cancellation
 
 Adaptive interference cancellation is enabled by default. After a CRC-validated

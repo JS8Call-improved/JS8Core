@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -45,6 +46,32 @@ double log_sum(std::array<double, 8> const& scores, int mask, bool set) {
   double sum = 0.0;
   for (int k = 0; k < 8; ++k) if (((k & mask) != 0) == set) sum += std::exp(scores[k] - largest);
   return largest + std::log(sum);
+}
+
+double phase(PilotChannel const& channel, double time, double tone) {
+  double const normalized = time / 39.0;
+  return channel.radians_per_symbol * time + channel.radians_per_tone * tone +
+      channel.edge_phase_radians * normalized * normalized;
+}
+
+struct PilotPoint { int s, k; std::complex<double> z; double w; };
+
+std::optional<double> prediction_error(PilotChannel const& channel,
+    std::span<PilotPoint const> held, double block_limit) {
+  double residual = 0.0, observed = 0.0;
+  std::array<double, 3> block_error{}, block_energy{};
+  for (auto const& p : held) {
+    auto const mean = channel.gain * std::polar(1.0, phase(channel, p.s - 39, p.k - 3.5));
+    double const e = p.w * std::norm(p.z - mean), power = p.w * std::norm(p.z);
+    residual += e;
+    observed += power;
+    block_error[p.s / 36] += e;
+    block_energy[p.s / 36] += power;
+  }
+  if (!std::isfinite(observed) || !std::isfinite(residual) || observed <= 0.0) return {};
+  for (int b = 0; b < 3; ++b)
+    if (block_energy[b] <= 0.0 || block_error[b] > block_limit * block_energy[b]) return {};
+  return residual / observed;
 }
 
 void append_symbol(BitLikelihoods& result, int data, std::array<double, 8> const& scores) {
@@ -93,8 +120,7 @@ std::optional<PilotChannel> estimate_pilot_channel(
     DisturbanceModel const& noise, DecodeControl const* control) {
   if (!valid(noise) || !allowed(control)) return {};
   // Each point uses only known pilot tones. Unknown data never train the model.
-  struct Point { int s, k; std::complex<double> z; double w; };
-  std::vector<Point> train, held;
+  std::vector<PilotPoint> train, held;
   for (int b = 0; b < 3; ++b) for (int j = 0; j < 7; ++j) {
     int const s = b * 36 + j, k = costas[b][j];
     if (!finite(observations[s][k])) return {};
@@ -138,19 +164,139 @@ std::optional<PilotChannel> estimate_pilot_channel(
       if (std::norm(fit(f * 0.005, t * 0.1)) > 0.85 * best) return {};
   }
   PilotChannel result{fit(omega, beta), omega, beta, 0.0};
-  double residual = 0.0, observed = 0.0;
-  std::array<double, 3> block_error{}, block_energy{};
-  for (auto const& p : held) {
-    auto const mean = result.gain * std::polar(1.0, omega * (p.s - 39) + beta * (p.k - 3.5));
-    double const e = p.w * std::norm(p.z - mean), power = p.w * std::norm(p.z);
-    residual += e; observed += power;
-    block_error[p.s / 36] += e; block_energy[p.s / 36] += power;
-  }
-  if (!std::isfinite(observed) || !std::isfinite(residual) || observed <= 0.0 || residual > 0.45 * observed) return {};
-  for (int b = 0; b < 3; ++b)
-    if (block_energy[b] <= 0.0 || block_error[b] > 0.65 * block_energy[b]) return {};
-  result.validation_error = residual / observed;
+  auto const error = prediction_error(result, held, 0.65);
+  if (!error || *error > 0.45) return {};
+  result.validation_error = *error;
   if (!allowed(control)) return {};
+  return result;
+}
+
+std::optional<PilotChannel> estimate_quadratic_channel(
+    ToneObservations const& observations, protocol::CostasArray const& costas,
+    DisturbanceModel const& noise, DecodeControl const* control) {
+  if (!valid(noise) || !allowed(control)) return {};
+  std::array<PilotPoint, 12> train{};
+  std::array<PilotPoint, 9> held{};
+  double weight = 0.0, energy = 0.0;
+  for (int b = 0; b < 3; ++b) {
+    for (int j = 0; j < 7; ++j) {
+      int const s = 36 * b + j, k = costas[b][j];
+      if (k < 0 || k >= 8 || !finite(observations[s][k])) return {};
+      PilotPoint const point{s, k, observations[s][k], 1.0 / noise.variance[k]};
+      if (j % 2) {
+        held[3 * b + j / 2] = point;
+      } else {
+        train[4 * b + j / 2] = point;
+        weight += point.w;
+        energy += point.w * std::norm(point.z);
+      }
+    }
+  }
+  if (!(energy > 0.0 && weight > 0.0) || !std::isfinite(energy) || !std::isfinite(weight)) return {};
+
+  // Grid dimensions cover residual rate, fractional timing, and phase
+  // curvature at either end. Cache the phasors for the inner search.
+  constexpr int rate_steps = 12, timing_steps = 8, drift_steps = 8;
+  constexpr double rate_spacing = 0.01, timing_spacing = 0.2, drift_spacing = 0.4;
+  using Rotation = std::array<std::complex<double>, 12>;
+  std::array<Rotation, 2 * rate_steps + 1> rate_rotation{};
+  std::array<Rotation, 2 * timing_steps + 1> timing_rotation{};
+  for (std::size_t i = 0; i < train.size(); ++i) {
+    for (int r = -rate_steps; r <= rate_steps; ++r)
+      rate_rotation[r + rate_steps][i] = std::polar(1.0, -r * rate_spacing * (train[i].s - 39));
+    for (int t = -timing_steps; t <= timing_steps; ++t)
+      timing_rotation[t + timing_steps][i] = std::polar(1.0, -t * timing_spacing * (train[i].k - 3.5));
+  }
+
+  struct Fit {
+    PilotChannel channel;
+    double power = 0.0;
+  };
+  Fit best, affine;
+  std::array<std::array<std::array<double, 2 * timing_steps + 1>, 2 * rate_steps + 1>,
+             2 * drift_steps + 1> grid{};
+  for (int d = -drift_steps; d <= drift_steps; ++d) {
+    if (!allowed(control)) return {};
+    double const curvature = d * drift_spacing;
+    Rotation weighted{};
+    for (std::size_t i = 0; i < train.size(); ++i) {
+      double const x = (train[i].s - 39) / 39.0;
+      weighted[i] = train[i].w * train[i].z * std::polar(1.0, -curvature * x * x) / weight;
+    }
+    for (int r = -rate_steps; r <= rate_steps; ++r) {
+      Rotation combined{};
+      for (std::size_t i = 0; i < train.size(); ++i)
+        combined[i] = weighted[i] * rate_rotation[r + rate_steps][i];
+      for (int t = -timing_steps; t <= timing_steps; ++t) {
+        std::complex<double> gain{};
+        for (std::size_t i = 0; i < train.size(); ++i)
+          gain += combined[i] * timing_rotation[t + timing_steps][i];
+        double const power = std::norm(gain);
+        grid[d + drift_steps][r + rate_steps][t + timing_steps] = power;
+        if (power > best.power)
+          best = {{gain, r * rate_spacing, t * timing_spacing, 0.0, curvature}, power};
+        if (d == 0 && power > affine.power)
+          affine = {{gain, r * rate_spacing, t * timing_spacing, 0.0}, power};
+      }
+    }
+  }
+
+  auto refine = [&](Fit& fit, bool drift) {
+    for (double scale : {0.5, 0.25, 0.125, 0.0625}) {
+      if (!allowed(control)) return;
+      auto const center = fit.channel;
+      for (int d = -static_cast<int>(drift); d <= static_cast<int>(drift); ++d) {
+        for (int r : {-1, 0, 1}) {
+          for (int t : {-1, 0, 1}) {
+            auto trial = center;
+            trial.radians_per_symbol += scale * r * rate_spacing;
+            trial.radians_per_tone += scale * t * timing_spacing;
+            trial.edge_phase_radians += scale * d * drift_spacing;
+            trial.gain = {};
+            for (auto const& p : train)
+              trial.gain += p.w * p.z *
+                  std::polar(1.0, -phase(trial, p.s - 39, p.k - 3.5));
+            trial.gain /= weight;
+            double const power = std::norm(trial.gain);
+            if (power > fit.power) fit = {trial, power};
+          }
+        }
+      }
+    }
+  };
+  refine(best, true);
+  auto& result = best.channel;
+  // The derivative is linear: its largest magnitude is at a frame end.
+  if (!allowed(control) || std::abs(result.edge_phase_radians) < 0.35 ||
+      std::abs(result.edge_phase_radians) >= 3.15 || std::abs(result.radians_per_tone) >= 1.58 ||
+      std::abs(result.radians_per_symbol) >= 0.115 ||
+      std::abs(result.radians_per_symbol) + 2 * std::abs(result.edge_phase_radians) / 39.0 >= 0.22 ||
+      best.power * weight < 0.6 * energy)
+    return {};
+
+  // A competing separated lobe makes the predicted data phases ambiguous.
+  for (int d = -drift_steps; d <= drift_steps; ++d) {
+    if (!allowed(control)) return {};
+    for (int r = -rate_steps; r <= rate_steps; ++r) {
+      auto const& timings = grid[d + drift_steps][r + rate_steps];
+      bool const separated_carrier = std::abs(d * drift_spacing - result.edge_phase_radians) >= 1.8 ||
+          std::abs(r * rate_spacing - result.radians_per_symbol) >= 0.055;
+      for (int t = -timing_steps; t <= timing_steps; ++t) {
+        bool const separated_timing = std::abs(t * timing_spacing - result.radians_per_tone) >= 0.9;
+        if ((separated_carrier || separated_timing) && timings[t + timing_steps] > 0.94 * best.power)
+          return {};
+      }
+    }
+  }
+
+  refine(affine, false);
+  auto const error = prediction_error(result, held, 0.45);
+  auto const affine_error = prediction_error(affine.channel, held, std::numeric_limits<double>::infinity());
+  if (!allowed(control) || !error || !affine_error ||
+      *error > 0.28 || *affine_error - *error < 0.04 || *error > 0.85 * *affine_error ||
+      best.power < 1.025 * affine.power)
+    return {};
+  result.validation_error = *error;
   return result;
 }
 
@@ -162,6 +308,7 @@ std::optional<BitLikelihoods> make_soft_likelihoods(
     for (auto const z : symbol) if (!finite(z)) return {};
   if (channel && (!std::isfinite(channel->gain.real()) || !std::isfinite(channel->gain.imag()) ||
       !std::isfinite(channel->radians_per_symbol) || !std::isfinite(channel->radians_per_tone) ||
+      !std::isfinite(channel->edge_phase_radians) ||
       !std::isfinite(channel->validation_error) || channel->validation_error < 0.0 ||
       channel->validation_error > 0.45)) return {};
   BitLikelihoods result{};
@@ -175,8 +322,7 @@ std::optional<BitLikelihoods> make_soft_likelihoods(
       auto const z = static_cast<std::complex<double>>(observations[s][k]);
       double const variance = noise.variance[k];
       if (channel) {
-        auto const mean = channel->gain * std::polar(1.0,
-            channel->radians_per_symbol * (s - 39) + channel->radians_per_tone * (k - 3.5));
+        auto const mean = channel->gain * std::polar(1.0, phase(*channel, s - 39, k - 3.5));
         // Inflate uncertainty by held-out prediction error, not a hard phase
         // decision. Common background terms cancel between tone hypotheses.
         scores[k] = (2.0 * std::real(z * std::conj(mean)) - std::norm(mean)) /

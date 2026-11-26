@@ -23,6 +23,8 @@ struct PilotChannel {
   double radians_per_symbol = 0.0;
   double radians_per_tone = 0.0;
   double validation_error = 1.0;
+  // Quadratic contribution at +/-39 symbols from the frame midpoint.
+  double edge_phase_radians = 0.0;
 };
 
 // Diagonal, frame-local model. Not a full covariance or a multipath equalizer.
@@ -33,6 +35,12 @@ std::optional<DisturbanceModel> estimate_disturbance(
 // Flat channel with affine time phase and tone-dependent timing phase. Fit on
 // even pilot columns; odd columns are held out and must predict successfully.
 std::optional<PilotChannel> estimate_pilot_channel(
+    ToneObservations const&, protocol::CostasArray const&, DisturbanceModel const&,
+    DecodeControl const* = nullptr);
+
+// Same extraction phase reference as the affine model. Require a bounded,
+// distinct drift solution and better predictions on held-out Costas pilots.
+std::optional<PilotChannel> estimate_quadratic_channel(
     ToneObservations const&, protocol::CostasArray const&, DisturbanceModel const&,
     DecodeControl const* = nullptr);
 

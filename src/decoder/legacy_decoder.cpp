@@ -59,9 +59,11 @@ constexpr std::ptrdiff_t kComplexStride =
 constexpr std::ptrdiff_t kFloatStride = static_cast<std::ptrdiff_t>(sizeof(float));
 constexpr std::complex<float> kZero{0.0f, 0.0f};
 
-struct NearMissBudget {
+struct RetryBudget {
   int rescue;
   int redemodulation;
+  int whitening;
+  int quadratic;
 };
 
 // Last try (pass 6): ordered statistics decoding of the full-evidence reading
@@ -205,7 +207,7 @@ class ChannelDecoder {
       std::optional<decoder::TrackedTrajectory>* trajectory = nullptr,
       DecodeControl const* control = nullptr, decoder::CoherentCostasPeak const* deep = nullptr,
       bool coherent_likelihood = false, int* adaptive_budget = nullptr,
-      NearMissBudget* near_miss_budget = nullptr, int* whitening_budget = nullptr);
+      RetryBudget* retry_budget = nullptr);
 
   // --- Signal reconstruction -----------------------------------------------
 
@@ -678,7 +680,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
     SymbolTracking tracking, int received_samples,
     std::optional<decoder::TrackedTrajectory>* trajectory, DecodeControl const* control,
     decoder::CoherentCostasPeak const* deep, [[maybe_unused]] bool coherent_likelihood,
-    int* adaptive_budget, NearMissBudget* near_miss_budget, [[maybe_unused]] int* whitening_budget)
+    int* adaptive_budget, RetryBudget* retry_budget)
     -> std::optional<AttemptResult> {
   if (trajectory) trajectory->reset();
   auto allowed = [&] {
@@ -755,8 +757,10 @@ auto ChannelDecoder<Mode>::attempt_decode(
   // demodulation window is left to deep sync or symbol tracking.
   std::optional<decoder::ToneObservations> observations;
   std::optional<decoder::DisturbanceModel> disturbance;
-  bool const try_whitening = whitening_budget && *whitening_budget > 0;
-  if ((coherent_likelihood || try_whitening) && (!control || control->allow_optional()) &&
+  std::optional<decoder::PilotChannel> affine_channel;
+  bool const try_whitening = retry_budget && retry_budget->whitening > 0;
+  bool const try_quadratic = retry_budget && retry_budget->quadratic > 0;
+  if ((coherent_likelihood || try_whitening || try_quadratic) && (!control || control->allow_optional()) &&
       (tracking != SymbolTracking::Disabled ||
        (best_time >= 0 && best_time + last_data_end <= demodulation_limit &&
         best_time + Mode::payload_samples <= received_limit))) {
@@ -998,8 +1002,8 @@ auto ChannelDecoder<Mode>::attempt_decode(
   decoder::BpNearMiss near_miss;
   std::array<float, kCodeLength> near_miss_llrs{};
   int source_pass = 0;
-  bool const gather_near_miss = near_miss_budget && sync_matches >= 9 &&
-      (near_miss_budget->rescue > 0 || near_miss_budget->redemodulation > 0);
+  bool const gather_near_miss = retry_budget && sync_matches >= 9 &&
+      (retry_budget->rescue > 0 || retry_budget->redemodulation > 0);
   if (gather_near_miss) near_miss.failed_checks = max_rescue_checks + 1;
   auto run_bp = [&](std::array<float, kCodeLength> const& llrs, int pass,
                     int iterations = 60, bool early_abort = true,
@@ -1065,10 +1069,10 @@ auto ChannelDecoder<Mode>::attempt_decode(
     if (!accepted && pass == 2 && coherent_likelihood && observations && optional_allowed()) {
       disturbance = decoder::estimate_disturbance(*observations, kCostas, true, control);
       if (disturbance) {
-        auto channel = decoder::estimate_pilot_channel(*observations, kCostas, *disturbance, control);
+        affine_channel = decoder::estimate_pilot_channel(*observations, kCostas, *disturbance, control);
         // An untrusted phase fit still permits the phase-independent Rician retry.
         if (auto llrs = decoder::make_soft_likelihoods(
-                *observations, *disturbance, channel ? &*channel : nullptr, control)) {
+                *observations, *disturbance, affine_channel ? &*affine_channel : nullptr, control)) {
           run_bp(*llrs, pass);
           accepted = accepts_codeword(pass, sync) && optional_allowed();
         }
@@ -1091,7 +1095,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
       disturbance = decoder::estimate_disturbance(*observations, kCostas, true, control);
     if (disturbance) {
       if (auto llrs = decoder::make_adaptive_likelihoods(*observations, kCostas, *disturbance, control)) {
-        --*whitening_budget;
+        --retry_budget->whitening;
         hard_errors = decoder::belief_propagation(*llrs, payload, codeword, 60, true, nullptr, control);
         if (accepts_codeword(2, sync) && optional_allowed()) {
           auto frame = make_frame();
@@ -1103,9 +1107,38 @@ auto ChannelDecoder<Mode>::attempt_decode(
   }
 #endif
 
-  if (!source_pass || !optional_allowed()) return std::nullopt;
-  if (near_miss_budget->rescue > 0) {
-    --near_miss_budget->rescue;
+  auto quadratic_retry = [&]() -> std::optional<AttemptResult> {
+#if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
+    if (!try_quadratic || !observations || sync_matches < kOsdMinSyncMatches ||
+        (affine_channel && affine_channel->validation_error < 0.04) || !optional_allowed())
+      return std::nullopt;
+    if (!disturbance && !coherent_likelihood && !try_whitening)
+      disturbance = decoder::estimate_disturbance(*observations, kCostas, true, control);
+    if (!disturbance) return std::nullopt;
+
+    --retry_budget->quadratic;
+    auto const channel = decoder::estimate_quadratic_channel(*observations, kCostas, *disturbance, control);
+    if (!channel) return std::nullopt;
+    auto const llrs = decoder::make_soft_likelihoods(*observations, *disturbance, &*channel, control);
+    if (!llrs) return std::nullopt;
+    hard_errors = decoder::belief_propagation(*llrs, payload, codeword, 60, true, nullptr, control);
+    if (!accepts_codeword(2, sync) || !optional_allowed()) return std::nullopt;
+    auto frame = make_frame();
+    if (!suitable_last_try(frame, frequency, offset)) return std::nullopt;
+    // A rejected aided attempt may have replaced the working magnitudes.
+    // Report using the original bins that the quadratic model actually scored.
+    for (int symbol = 0; symbol < kChannelSymbols; ++symbol)
+      for (int row = 0; row < kToneRows; ++row)
+        tone_power[row][symbol] = std::abs((*observations)[symbol][row]) / 1000.0f;
+    return finalize(std::move(frame), sync, false);
+#else
+    return std::nullopt;
+#endif
+  };
+
+  if (!source_pass || !optional_allowed()) return quadratic_retry();
+  if (retry_budget->rescue > 0) {
+    --retry_budget->rescue;
     auto const seed_llrs = near_miss_llrs;
     int const seed_pass = source_pass;
     for (float scale : {1.0f, 0.85f, 1.15f}) {
@@ -1122,11 +1155,11 @@ auto ChannelDecoder<Mode>::attempt_decode(
     }
   }
 
-  if (near_miss_budget->redemodulation <= 0 || near_miss.failed_checks > max_aided_checks ||
+  if (retry_budget->redemodulation <= 0 || near_miss.failed_checks > max_aided_checks ||
       best_time < 0 || best_time + last_data_end > demodulation_limit ||
       best_time + Mode::payload_samples > received_limit || !optional_allowed())
-    return std::nullopt;
-  --near_miss_budget->redemodulation;
+    return quadratic_retry();
+  --retry_budget->redemodulation;
 
   // Replay coarse extraction from the actual FFT center, including the
   // original frequency correction. Do not reuse a partially rotated buffer.
@@ -1139,7 +1172,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
   auto const aided = decoder::redemodulate_near_miss(
       std::span(channel_).first(received_limit), best_time, Mode::downsample_sps,
       down_rate, near_miss.bits, kCostas, control);
-  if (aided.samples.empty()) return std::nullopt;
+  if (aided.samples.empty()) return quadratic_retry();
   for (int symbol = 0; symbol < kChannelSymbols; ++symbol) {
     if (!optional_allowed()) return std::nullopt;
     std::copy_n(aided.samples.begin() + symbol * Mode::downsample_sps,
@@ -1149,13 +1182,13 @@ auto ChannelDecoder<Mode>::attempt_decode(
   }
   hard_errors = decoder::belief_propagation(pass_two_llrs(received_limit), payload, codeword,
                                            60, true, nullptr, control);
-  if (!accepts_codeword(2, aided.sync_power) || !optional_allowed()) return std::nullopt;
+  if (!accepts_codeword(2, aided.sync_power) || !optional_allowed()) return quadratic_retry();
   constexpr float channel_resolution = 12000.0f / Mode::ds_fft_span;
   float const aided_hz = std::round(acquisition_frequency / channel_resolution) * channel_resolution +
       best_delta + static_cast<float>(aided.frequency_hz);
   float const aided_dt = refined_offset + static_cast<float>(aided.timing_samples / down_rate);
   auto frame = make_frame();
-  if (!suitable_last_try(frame, aided_hz, aided_dt)) return std::nullopt;
+  if (!suitable_last_try(frame, aided_hz, aided_dt)) return quadratic_retry();
   frequency = aided_hz;
   offset = aided_dt;
   return finalize(std::move(frame), aided.sync_power, false);
@@ -1298,9 +1331,10 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
   reported_.clear();
   int rescue_budget = 32;
   int adaptive_budget = 4;
-  NearMissBudget near_miss_budget{data.params.ldpc_rescue ? 4 : 0,
-                                 data.params.aided_redemodulation ? 2 : 0};
-  int whitening_budget = 4;
+  RetryBudget retry_budget{data.params.ldpc_rescue ? 4 : 0,
+                           data.params.aided_redemodulation ? 2 : 0,
+                           data.params.adaptive_whitening ? 4 : 0,
+                           data.params.quadratic_phase ? 3 : 0};
 
   for (int pass = 1; pass <= 3; ++pass) {
     if (control.is_canceled()) break;
@@ -1334,8 +1368,7 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
                                    SymbolTracking::Disabled, count, nullptr, &control, nullptr,
                                     data.params.coherent_likelihood,
                                     data.params.adaptive_sic ? &adaptive_budget : nullptr,
-                                    &near_miss_budget,
-                                    data.params.adaptive_whitening ? &whitening_budget : nullptr);
+                                    &retry_budget);
       if (!result) continue;
       changed |= result->subtracted;
 

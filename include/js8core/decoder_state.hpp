@@ -48,6 +48,8 @@ struct DecodeParams {
   bool aided_redemodulation = true;
   // Retry with tone- and time-dependent noise estimates.
   bool adaptive_whitening = true;
+  // Retry coherent decoding with a pilot-validated carrier drift estimate.
+  bool quadratic_phase = true;
 };
 
 struct DecodeState {

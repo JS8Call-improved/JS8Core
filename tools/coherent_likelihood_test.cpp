@@ -42,6 +42,7 @@ namespace {
 static_assert(DecodeParams{}.coherent_likelihood);
 static_assert(EngineConfig{}.coherent_likelihood);
 static_assert(DecodeParams{}.adaptive_whitening && EngineConfig{}.adaptive_whitening);
+static_assert(DecodeParams{}.quadratic_phase && EngineConfig{}.quadratic_phase);
 
 bool adaptive_likelihoods_test() {
   auto const& pilots = costas(CostasType::Modified);
@@ -141,7 +142,7 @@ bool decode_whitening_fixture(bool bursts) {
   return passed;
 }
 
-bool decode_phase_fixture() {
+bool decode_phase_fixture(double edge_phase = 0.0) {
   constexpr char frame[] = "Ux2zqX++++++";
   constexpr int rate = 12000, count = 15 * rate, start = 6000, symbol_samples = 1920;
   test::TrackingSignal wanted;
@@ -149,12 +150,18 @@ bool decode_phase_fixture() {
   wanted.symbol_seconds = static_cast<double>(symbol_samples) / rate;
   wanted.amplitude = 1450;
   wanted.phase_radians = 0.9;
+  if (edge_phase != 0.0) {
+    wanted.base_hz = 1499.964;
+    double const midpoint = 39.0 * wanted.symbol_seconds;
+    wanted.frequency_slope_hz_s = edge_phase / (0.5 * test::kWaveTau * midpoint * midpoint);
+    wanted.frequency_offset_hz = -wanted.frequency_slope_hz_s * midpoint;
+  }
   legacy_encode(4, costas(CostasType::Original), frame, wanted.tones.data());
 
   // Give each data symbol a stronger competing tone with the opposite
   // phase. Its magnitude wins, but the Costas-based phase model rejects it.
   auto competing = wanted;
-  competing.amplitude = 2300;
+  competing.amplitude = edge_phase == 0.0 ? 2300 : 2102.5;
   competing.phase_radians += test::kWaveTau / 2;
   for (std::size_t symbol = 0; symbol < competing.tones.size(); ++symbol)
     competing.tones[symbol] ^= 1 + static_cast<int>(symbol % 7);
@@ -190,13 +197,14 @@ bool decode_phase_fixture() {
   DecodeControl deny;
   deny.optional_allowed = [] { return false; };
   bool const with_no_budget = finds_frame(deny);
-  state.params.coherent_likelihood = false;
+  if (edge_phase == 0.0) state.params.coherent_likelihood = false;
+  else state.params.quadratic_phase = false;
   bool const opted_out = finds_frame();
   if (by_default == static_cast<bool>(JS8CORE_EXPECT_SOFT_DEMAPPER) &&
       !with_no_budget && !opted_out)
     return true;
-  std::fprintf(stderr, "phase fixture: default=%d, no budget=%d, opted out=%d\n",
-               by_default, with_no_budget, opted_out);
+  std::fprintf(stderr, "phase fixture (%+.2f rad): default=%d, no budget=%d, opted out=%d\n",
+               edge_phase, by_default, with_no_budget, opted_out);
   return false;
 }
 
@@ -361,6 +369,46 @@ bool signal_test() {
   return true;
 }
 
+bool quadratic_channel_test() {
+  auto const& pilots = costas(CostasType::Modified);
+  auto const tones = signal_tones();
+  std::mt19937 rng(0x55ad);
+  auto const affine = synthesize_obs(pilots, tones, 0.021, -0.37, 200.0, 1.0, rng);
+  auto const noise = estimate_disturbance(affine, pilots, true);
+  if (!noise || estimate_quadratic_channel(affine, pilots, *noise)) {
+    std::fprintf(stderr, "quadratic fit: constant offset should keep the affine model\n");
+    return false;
+  }
+  for (double edge : {-2.0, 2.0}) {
+    auto obs = affine;
+    for (int symbol = 0; symbol < data::kChannelSymbols; ++symbol) {
+      double const x = (symbol - 39) / 39.0;
+      auto const rotation = std::polar(1.0f, static_cast<float>(edge * x * x));
+      for (auto& bin : obs[symbol]) bin *= rotation;
+    }
+    auto const fit = estimate_quadratic_channel(obs, pilots, *noise);
+    auto const llrs = fit ? make_soft_likelihoods(obs, *noise, &*fit) : std::nullopt;
+    if (!fit || std::abs(fit->edge_phase_radians - edge) > 0.08 ||
+        fit->validation_error > 0.005 || !llrs || decode_tones(*llrs) != tones) {
+      std::fprintf(stderr, "quadratic fit: failed to recover signed drift %g\n", edge);
+      return false;
+    }
+    int probes = 0;
+    DecodeControl interrupted;
+    interrupted.optional_allowed = [&] { return ++probes < 8; };
+    if (estimate_quadratic_channel(obs, pilots, *noise, &interrupted)) {
+      std::fprintf(stderr, "quadratic fit: interrupted search returned a model\n");
+      return false;
+    }
+    for (int j : {1, 3, 5}) obs[72 + j][pilots[2][j]] *= -1.0f;
+    if (estimate_quadratic_channel(obs, pilots, *noise)) {
+      std::fprintf(stderr, "quadratic fit: failed to reject a contradictory held-out block\n");
+      return false;
+    }
+  }
+  return true;
+}
+
 bool noise_only_test() {
   CostasArray const& costas = protocol::costas(CostasType::Modified);
   std::mt19937 rng(0x1001);
@@ -375,6 +423,13 @@ bool noise_only_test() {
   }
   if (estimate_pilot_channel(obs, costas, DisturbanceModel{}).has_value()) {
     std::fprintf(stderr, "noise_only_test: expected empty PilotChannel\n");
+    return false;
+  }
+  DisturbanceModel noise;
+  noise.variance.fill(2.0);
+  noise.amplitude = 1.0;
+  if (estimate_quadratic_channel(obs, costas, noise)) {
+    std::fprintf(stderr, "noise_only_test: quadratic channel fit unexpectedly accepted\n");
     return false;
   }
   std::printf("  noise_only_test: empty model and channel as expected\n");
@@ -477,6 +532,9 @@ int main(int argc, char** argv) {
   failures += no_pilot_nan_test() ? 0 : 1;
   failures += large_phase_gate_test() ? 0 : 1;
   failures += decode_phase_fixture() ? 0 : 1;
+  failures += decode_phase_fixture(-2.14) ? 0 : 1;
+  failures += decode_phase_fixture(2.14) ? 0 : 1;
+  failures += quadratic_channel_test() ? 0 : 1;
   failures += adaptive_likelihoods_test() ? 0 : 1;
   failures += decode_whitening_fixture(false) ? 0 : 1;
   failures += decode_whitening_fixture(true) ? 0 : 1;
