@@ -30,6 +30,9 @@
 #include "decoder_tables.hpp"
 #include "frame_history.hpp"
 #include "ldpc.hpp"
+#if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
+#include "soft_likelihood.hpp"
+#endif
 #include "symbol_tracking.hpp"
 #include "tracked_reference.hpp"
 
@@ -817,37 +820,6 @@ auto ChannelDecoder<Mode>::attempt_decode(
               data_power[static_cast<std::size_t>(row)].begin() + 29);
   }
 
-  std::array<float, 3 * kDataSymbols> amplitude_llr{};
-  std::array<float, 3 * kDataSymbols> logarithmic_llr{};
-
-  for (int symbol = 0; symbol < kDataSymbols; ++symbol) {
-    std::array<float, kToneRows> power{};
-    for (int row = 0; row < kToneRows; ++row) {
-      power[static_cast<std::size_t>(row)] =
-          data_power[static_cast<std::size_t>(row)][static_cast<std::size_t>(symbol)];
-    }
-
-    std::size_t const bit0 = static_cast<std::size_t>(3 * symbol);
-    std::size_t const bit1 = bit0 + 1;
-    std::size_t const bit2 = bit0 + 2;
-
-    amplitude_llr[bit0] = std::max({power[4], power[5], power[6], power[7]}) -
-                          std::max({power[0], power[1], power[2], power[3]});
-    amplitude_llr[bit1] = std::max({power[2], power[3], power[6], power[7]}) -
-                          std::max({power[0], power[1], power[4], power[5]});
-    amplitude_llr[bit2] = std::max({power[1], power[3], power[5], power[7]}) -
-                          std::max({power[0], power[2], power[4], power[6]});
-
-    for (float& value : power) value = std::log(value + 1e-32f);
-
-    logarithmic_llr[bit0] = std::max({power[4], power[5], power[6], power[7]}) -
-                            std::max({power[0], power[1], power[2], power[3]});
-    logarithmic_llr[bit1] = std::max({power[2], power[3], power[6], power[7]}) -
-                            std::max({power[0], power[1], power[4], power[5]});
-    logarithmic_llr[bit2] = std::max({power[1], power[3], power[5], power[7]}) -
-                            std::max({power[0], power[2], power[4], power[6]});
-  }
-
   auto normalize = [](auto& values) {
     float sum = 0.0f;
     float squares = 0.0f;
@@ -867,11 +839,42 @@ auto ChannelDecoder<Mode>::attempt_decode(
     for (float& value : values) value = (value / sigma) * 2.83f;
   };
 
-  normalize(amplitude_llr);
-  normalize(logarithmic_llr);
+  auto max_tone_llrs = [&](bool logarithmic) {
+    std::array<float, kCodeLength> llrs{};
+    for (std::size_t symbol = 0; symbol < kDataSymbols; ++symbol) {
+      std::array<float, kToneRows> power{};
+      for (std::size_t row = 0; row < kToneRows; ++row) {
+        float const value = data_power[row][symbol];
+        power[row] = logarithmic ? std::log(value + 1e-32f) : value;
+      }
+      llrs[3 * symbol] = std::max({power[4], power[5], power[6], power[7]}) -
+                         std::max({power[0], power[1], power[2], power[3]});
+      llrs[3 * symbol + 1] = std::max({power[2], power[3], power[6], power[7]}) -
+                             std::max({power[0], power[1], power[4], power[5]});
+      llrs[3 * symbol + 2] = std::max({power[1], power[3], power[5], power[7]}) -
+                             std::max({power[0], power[2], power[4], power[6]});
+    }
+    normalize(llrs);
+    return llrs;
+  };
+
+  auto amplitude_llr = max_tone_llrs(false);
   // Later erasure passes modify amplitude_llr. Preserve the full evidence
   // for stronger BP and the optional last-try OSD.
   auto const pristine_amplitude_llr = amplitude_llr;
+
+  auto pass_two_llrs = [&] {
+#if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
+    if (tracking == SymbolTracking::Disabled) {
+      int const available = std::min(Mode::payload_samples, received_samples / Mode::downsample_factor);
+      if (auto soft = decoder::soft_frame_llrs(tone_power, kCostas, best_time,
+                                               Mode::downsample_sps, available))
+        return *soft;
+    }
+#endif
+    // Only compute the legacy log metric if pass 2 actually needs it.
+    return max_tone_llrs(true);
+  };
 
   std::array<std::int8_t, kPayloadBits> payload{};
   std::array<std::int8_t, kCodeLength> codeword{};
@@ -914,13 +917,12 @@ auto ChannelDecoder<Mode>::attempt_decode(
       std::fill(amplitude_llr.begin() + 24, amplitude_llr.begin() + 48, 0.0f);
     }
 
-    if (pass <= 5) {
-      auto const& llr = (pass == 5) ? rescue_llr
-                        : (pass == 2) ? logarithmic_llr : amplitude_llr;
-      hard_errors = pass == 5
-          ? decoder::belief_propagation(llr, payload, codeword, 150, false)
-          : decoder::belief_propagation(llr, payload, codeword);
-    }
+    if (pass == 2)
+      hard_errors = decoder::belief_propagation(pass_two_llrs(), payload, codeword);
+    else if (pass == 5)
+      hard_errors = decoder::belief_propagation(rescue_llr, payload, codeword, 150, false);
+    else if (pass <= 5)
+      hard_errors = decoder::belief_propagation(amplitude_llr, payload, codeword);
     snr = -99.0f;
 
     if (std::all_of(codeword.begin(), codeword.end(),
@@ -1119,7 +1121,7 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
 
       auto result = attempt_decode(data.params.syncStats, subtract, frequency,
                                    offset, hard_errors, snr, rescue_budget, emit,
-                                   SymbolTracking::Disabled, 0, nullptr, &control);
+                                   SymbolTracking::Disabled, count, nullptr, &control);
       if (!result) continue;
       changed |= result->subtracted;
 

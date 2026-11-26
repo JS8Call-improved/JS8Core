@@ -188,6 +188,15 @@ a sibling host project's `vendor/` directory.
 Run `js8core-android-compat-test` alongside the native regressions to check
 external PTT, offline status callbacks, and accelerated audio submission.
 
+## Soft symbol likelihoods
+
+The second ordinary decode pass uses noncoherent soft likelihoods by default:
+it combines evidence from all eight tones and falls back to the previous
+metric when it cannot estimate a usable noise floor. Build with
+`-DJS8CORE_SOFT_DEMAPPER=OFF` to compare against the previous metric. See
+[the validation notes](docs/soft-likelihood-validation.md) for the model and
+paired benchmark results.
+
 ## Experimental symbol tracking
 
 Per-symbol frequency and timing corrections are enabled by default as a receive
@@ -211,7 +220,7 @@ and overwritten windows are canceled rather than delivered into a newer RX conte
 See [symbol-tracking validation](docs/symbol-tracking-validation.md) for the
 independent mathematical model, controls, tests, development measurements and
 remaining validation limits. These defaults also apply to direct `DecodeParams`
-users. To restore the original decoder, explicitly configure:
+users. To disable symbol tracking and tracked cancellation, explicitly configure:
 
 ```cpp
 config.symbol_tracking = js8core::SymbolTracking::Disabled;

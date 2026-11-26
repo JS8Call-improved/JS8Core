@@ -21,6 +21,7 @@ project(js8core
 # coefficients are independently designed. See docs/protocol-data-provenance.md.
 
 option(JS8CORE_WITH_VARI "Build varicode.cpp (required by the engine)" ON)
+option(JS8CORE_SOFT_DEMAPPER "Use noncoherent soft likelihoods on ordinary decode pass 2" ON)
 if(NOT JS8CORE_WITH_VARI)
   message(FATAL_ERROR "JS8CORE_WITH_VARI=OFF is not supported while the engine depends on varicode")
 endif()
@@ -36,6 +37,7 @@ add_library(js8core STATIC
   src/engine/engine.cpp
   src/decoder/legacy_decoder.cpp
   src/decoder/ldpc.cpp
+  src/decoder/soft_likelihood.cpp
   src/decoder/symbol_tracking.cpp
   src/decoder/tracked_reference.cpp
   src/dsp/flatten.cpp
@@ -59,6 +61,10 @@ if(JS8CORE_WITH_VARI)
 endif()
 
 add_library(js8core::js8core ALIAS js8core)
+
+if(NOT JS8CORE_SOFT_DEMAPPER)
+  target_compile_definitions(js8core PRIVATE JS8CORE_DISABLE_SOFT_DEMAPPER)
+endif()
 
 target_compile_features(js8core PUBLIC cxx_std_20)
 
@@ -155,6 +161,15 @@ target_compile_features(js8core-decoder-roundtrip-test PRIVATE cxx_std_20)
 target_include_directories(js8core-decoder-roundtrip-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(js8core-decoder-roundtrip-test PRIVATE js8core)
 
+add_executable(js8core-soft-likelihood-test EXCLUDE_FROM_ALL tools/soft_likelihood_test.cpp)
+target_include_directories(js8core-soft-likelihood-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(js8core-soft-likelihood-test PRIVATE
+  JS8CORE_EXPECT_SOFT_DEMAPPER=$<BOOL:${JS8CORE_SOFT_DEMAPPER}>)
+target_link_libraries(js8core-soft-likelihood-test PRIVATE js8core)
+
+add_executable(js8core-soft-likelihood-benchmark EXCLUDE_FROM_ALL tools/soft_likelihood_benchmark.cpp)
+target_link_libraries(js8core-soft-likelihood-benchmark PRIVATE js8core)
+
 add_executable(js8core-tracking-waveform-test EXCLUDE_FROM_ALL
   tools/tracking_waveform_test.cpp
 )
@@ -198,6 +213,7 @@ if(BUILD_TESTING)
   add_test(NAME js8core-vox COMMAND js8core-vox-test)
   add_test(NAME js8core-clock-math COMMAND js8core-clock-math-test)
   add_test(NAME js8core-decoder-roundtrip COMMAND js8core-decoder-roundtrip-test)
+  add_test(NAME js8core-soft-likelihood COMMAND js8core-soft-likelihood-test)
   add_test(NAME js8core-tracking-waveform COMMAND js8core-tracking-waveform-test)
   add_test(NAME js8core-symbol-tracking COMMAND js8core-symbol-tracking-test)
   add_test(NAME js8core-tracked-extraction COMMAND js8core-tracked-extraction-test)
