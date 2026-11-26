@@ -41,6 +41,105 @@ namespace {
 
 static_assert(DecodeParams{}.coherent_likelihood);
 static_assert(EngineConfig{}.coherent_likelihood);
+static_assert(DecodeParams{}.adaptive_whitening && EngineConfig{}.adaptive_whitening);
+
+bool adaptive_likelihoods_test() {
+  auto const& pilots = costas(CostasType::Modified);
+  ToneObservations bins{};
+  for (auto& symbol : bins) symbol.fill({1.0f, 0.0f});
+  DisturbanceModel noise;
+  noise.variance.fill(1.0);
+  noise.amplitude = 2.0;
+  bins[9][6] = {12.0f, 0.0f};
+  if (make_adaptive_likelihoods(bins, pilots, noise)) {
+    std::fprintf(stderr, "adaptive whitening: one isolated large bin looks like a burst\n");
+    return false;
+  }
+
+  bins[8].fill({10.0f, 0.0f});
+  bins[8][6] = {12.0f, 0.0f};
+  auto const timed = make_adaptive_likelihoods(bins, pilots, noise);
+  if (!timed || std::abs((*timed)[3]) >= 1.0f || (*timed)[6] <= 4.0f) {
+    std::fprintf(stderr, "adaptive whitening: wideband burst did not lose weight\n");
+    return false;
+  }
+
+  bins[8].fill({1.0f, 0.0f});
+  bins[7].fill({});
+  noise.variance[7] = 4.0;
+  auto const unequal = make_adaptive_likelihoods(bins, pilots, noise);
+  // At zero energy, the hypothesis weights are N/(N+S): 1/5 or 1/2.
+  double const expected = std::log((3.0 / 5.0 + 0.5) / (4.0 / 5.0));
+  if (!unequal || std::abs((*unequal)[0] - expected) > 1e-6) {
+    std::fprintf(stderr, "adaptive whitening: per-tone normalization is incorrect\n");
+    return false;
+  }
+
+  bins[15][3] = {std::numeric_limits<float>::quiet_NaN(), 0.0f};
+  return !make_adaptive_likelihoods(bins, pilots, noise);
+}
+
+bool decode_whitening_fixture(bool bursts) {
+  constexpr char frame[] = "Ux2zqX++++++";
+  constexpr int rate = kJs8RxSampleRate, count = 4 * rate, start = 1350, symbol_samples = 384;
+  test::TrackingSignal wanted;
+  wanted.start_seconds = static_cast<double>(start) / rate;
+  wanted.symbol_seconds = static_cast<double>(symbol_samples) / rate;
+  wanted.amplitude = bursts ? 1302.0 : 1356.25;
+  wanted.phase_radians = bursts ? 0.54 : 0.27;
+  legacy_encode(4, costas(CostasType::Modified), frame, wanted.tones.data());
+
+  DecodeState state;
+  state.samples = test::render_tracking_audio(
+      std::array{test::TrackingWaveform(wanted)}, rate, count);
+  std::mt19937 random(bursts ? 36 : 1);
+  double const carrier_step = test::kWaveTau * 1562.5 / rate;
+  for (int i = 0; i < count; ++i) {
+    int const symbol = i >= start ? (i - start) / symbol_samples : -1;
+    bool const burst = bursts && ((symbol >= 20 && symbol < 26) ||
+                                  (symbol >= 53 && symbol < 57));
+    double const pilot_gain = symbol >= 0 && symbol % 36 < 7 ? 3.5 : 1.0;
+    double const noise = (static_cast<int>(random() >> 16) - 32768) / 32768.0 *
+        (burst ? 27000.0 : 6600.0);
+    double const carrier = bursts ? 0.0 : 1.08 * wanted.amplitude * std::sin(carrier_step * i + 0.3);
+    double const audio = pilot_gain * state.samples[i] + noise + carrier;
+    state.samples[i] = static_cast<std::int16_t>(std::clamp(audio, -32768.0, 32767.0));
+  }
+  state.samples.resize(kJs8NtMax * rate);
+  state.params.nfa = 1450;
+  state.params.nfb = 1620;
+  state.params.nsubmodes = 1 << 4;
+  state.params.kszI = count;
+  state.params.symbol_tracking = SymbolTracking::Disabled;
+  state.params.deep_sync = false;
+
+  auto decode = [&](DecodeControl const& control = {}) {
+    int expected = 0, unexpected = 0;
+    decode_with_control(state, [&](events::Variant const& event) {
+      if (auto const* decoded = std::get_if<events::Decoded>(&event)) {
+        if (decoded->type == 4 && decoded->data == frame) ++expected;
+        else ++unexpected;
+      }
+    }, control);
+    return std::pair{expected, unexpected};
+  };
+  auto const adaptive = decode();
+  DecodeControl deny;
+  deny.optional_allowed = [] { return false; };
+  auto const denied = decode(deny);
+  state.params.adaptive_whitening = false;
+  auto const baseline = decode();
+  constexpr bool expect_soft = JS8CORE_EXPECT_SOFT_DEMAPPER;
+  bool const passed = expect_soft
+      ? adaptive == std::pair{1, 0} && denied == std::pair{0, 0} && baseline == std::pair{0, 0}
+      : adaptive == baseline && baseline.second == 0 && denied.second == 0;
+  if (!passed) {
+    std::fprintf(stderr, "adaptive whitening %s fixture: adaptive=%d/%d denied=%d/%d baseline=%d/%d\n",
+                 bursts ? "burst" : "carrier", adaptive.first, adaptive.second,
+                 denied.first, denied.second, baseline.first, baseline.second);
+  }
+  return passed;
+}
 
 bool decode_phase_fixture() {
   constexpr char frame[] = "Ux2zqX++++++";
@@ -378,6 +477,9 @@ int main(int argc, char** argv) {
   failures += no_pilot_nan_test() ? 0 : 1;
   failures += large_phase_gate_test() ? 0 : 1;
   failures += decode_phase_fixture() ? 0 : 1;
+  failures += adaptive_likelihoods_test() ? 0 : 1;
+  failures += decode_whitening_fixture(false) ? 0 : 1;
+  failures += decode_whitening_fixture(true) ? 0 : 1;
 
   std::printf("[decode-regression]\n");
   failures += run_decode_regression(argc, argv);

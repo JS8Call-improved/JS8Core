@@ -205,7 +205,7 @@ class ChannelDecoder {
       std::optional<decoder::TrackedTrajectory>* trajectory = nullptr,
       DecodeControl const* control = nullptr, decoder::CoherentCostasPeak const* deep = nullptr,
       bool coherent_likelihood = false, int* adaptive_budget = nullptr,
-      NearMissBudget* near_miss_budget = nullptr);
+      NearMissBudget* near_miss_budget = nullptr, int* whitening_budget = nullptr);
 
   // --- Signal reconstruction -----------------------------------------------
 
@@ -678,7 +678,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
     SymbolTracking tracking, int received_samples,
     std::optional<decoder::TrackedTrajectory>* trajectory, DecodeControl const* control,
     decoder::CoherentCostasPeak const* deep, [[maybe_unused]] bool coherent_likelihood,
-    int* adaptive_budget, NearMissBudget* near_miss_budget)
+    int* adaptive_budget, NearMissBudget* near_miss_budget, [[maybe_unused]] int* whitening_budget)
     -> std::optional<AttemptResult> {
   if (trajectory) trajectory->reset();
   auto allowed = [&] {
@@ -754,7 +754,9 @@ auto ChannelDecoder<Mode>::attempt_decode(
   // Extend pilot observations only; recovering data beyond the ordinary
   // demodulation window is left to deep sync or symbol tracking.
   std::optional<decoder::ToneObservations> observations;
-  if (coherent_likelihood && (!control || control->allow_optional()) &&
+  std::optional<decoder::DisturbanceModel> disturbance;
+  bool const try_whitening = whitening_budget && *whitening_budget > 0;
+  if ((coherent_likelihood || try_whitening) && (!control || control->allow_optional()) &&
       (tracking != SymbolTracking::Disabled ||
        (best_time >= 0 && best_time + last_data_end <= demodulation_limit &&
         best_time + Mode::payload_samples <= received_limit))) {
@@ -1060,12 +1062,13 @@ auto ChannelDecoder<Mode>::attempt_decode(
 #if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
     // Keep the established pass-2 result whenever it passes all decode gates.
     // Only a rejected result can spend the optional budget on another BP try.
-    if (!accepted && pass == 2 && observations && optional_allowed()) {
-      if (auto model = decoder::estimate_disturbance(*observations, kCostas, true, control)) {
-        auto channel = decoder::estimate_pilot_channel(*observations, kCostas, *model, control);
+    if (!accepted && pass == 2 && coherent_likelihood && observations && optional_allowed()) {
+      disturbance = decoder::estimate_disturbance(*observations, kCostas, true, control);
+      if (disturbance) {
+        auto channel = decoder::estimate_pilot_channel(*observations, kCostas, *disturbance, control);
         // An untrusted phase fit still permits the phase-independent Rician retry.
         if (auto llrs = decoder::make_soft_likelihoods(
-                *observations, *model, channel ? &*channel : nullptr, control)) {
+                *observations, *disturbance, channel ? &*channel : nullptr, control)) {
           run_bp(*llrs, pass);
           accepted = accepts_codeword(pass, sync) && optional_allowed();
         }
@@ -1079,6 +1082,26 @@ auto ChannelDecoder<Mode>::attempt_decode(
     // OSD results are report-only.
     return finalize(std::move(frame), sync, pass != 6);
   }
+
+#if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
+  // Keep the established metrics and OSD ahead of this retry. Its evidence is
+  // from the same capture, so run BP on it separately.
+  if (try_whitening && observations && sync_matches >= kOsdMinSyncMatches && optional_allowed()) {
+    if (!coherent_likelihood)
+      disturbance = decoder::estimate_disturbance(*observations, kCostas, true, control);
+    if (disturbance) {
+      if (auto llrs = decoder::make_adaptive_likelihoods(*observations, kCostas, *disturbance, control)) {
+        --*whitening_budget;
+        hard_errors = decoder::belief_propagation(*llrs, payload, codeword, 60, true, nullptr, control);
+        if (accepts_codeword(2, sync) && optional_allowed()) {
+          auto frame = make_frame();
+          if (suitable_last_try(frame, frequency, offset))
+            return finalize(std::move(frame), sync, false);
+        }
+      }
+    }
+  }
+#endif
 
   if (!source_pass || !optional_allowed()) return std::nullopt;
   if (near_miss_budget->rescue > 0) {
@@ -1277,6 +1300,7 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
   int adaptive_budget = 4;
   NearMissBudget near_miss_budget{data.params.ldpc_rescue ? 4 : 0,
                                  data.params.aided_redemodulation ? 2 : 0};
+  int whitening_budget = 4;
 
   for (int pass = 1; pass <= 3; ++pass) {
     if (control.is_canceled()) break;
@@ -1310,7 +1334,8 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
                                    SymbolTracking::Disabled, count, nullptr, &control, nullptr,
                                     data.params.coherent_likelihood,
                                     data.params.adaptive_sic ? &adaptive_budget : nullptr,
-                                    &near_miss_budget);
+                                    &near_miss_budget,
+                                    data.params.adaptive_whitening ? &whitening_budget : nullptr);
       if (!result) continue;
       changed |= result->subtracted;
 

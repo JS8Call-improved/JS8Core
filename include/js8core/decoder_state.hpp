@@ -46,6 +46,8 @@ struct DecodeParams {
   // Optional near-miss retries after the established decoder attempts.
   bool ldpc_rescue = true;
   bool aided_redemodulation = true;
+  // Retry with tone- and time-dependent noise estimates.
+  bool adaptive_whitening = true;
 };
 
 struct DecodeState {

@@ -11,7 +11,8 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 bool allowed(DecodeControl const* c) { return !c || c->allow_optional(); }
 bool finite(std::complex<float> z) { return std::isfinite(z.real()) && std::isfinite(z.imag()); }
-double median(std::vector<double> values) {
+template <typename Samples>
+double median(Samples values) {
   auto middle = values.begin() + values.size() / 2;
   std::nth_element(values.begin(), middle, values.end());
   return *middle;
@@ -44,6 +45,14 @@ double log_sum(std::array<double, 8> const& scores, int mask, bool set) {
   double sum = 0.0;
   for (int k = 0; k < 8; ++k) if (((k & mask) != 0) == set) sum += std::exp(scores[k] - largest);
   return largest + std::log(sum);
+}
+
+void append_symbol(BitLikelihoods& result, int data, std::array<double, 8> const& scores) {
+  for (int bit = 0; bit < 3; ++bit) {
+    int const mask = 1 << (2 - bit);
+    result[3 * data + bit] = static_cast<float>(std::clamp(
+        log_sum(scores, mask, true) - log_sum(scores, mask, false), -20.0, 20.0));
+  }
 }
 } // namespace
 
@@ -178,12 +187,70 @@ std::optional<BitLikelihoods> make_soft_likelihoods(
       }
       if (!std::isfinite(scores[k])) return {};
     }
-    for (int bit = 0; bit < 3; ++bit) {
-      int const mask = 1 << (2 - bit);
-      result[3 * data + bit] = static_cast<float>(std::clamp(
-          log_sum(scores, mask, true) - log_sum(scores, mask, false), -20.0, 20.0));
-    }
+    append_symbol(result, data, scores);
     ++data;
+  }
+  if (!allowed(control)) return {};
+  return result;
+}
+
+std::optional<BitLikelihoods> make_adaptive_likelihoods(
+    ToneObservations const& observations, protocol::CostasArray const& costas,
+    DisturbanceModel const& noise, DecodeControl const* control) {
+  if (!valid(noise) || !allowed(control)) return {};
+
+  // Normalize by the frame-wide variance before looking for power spread
+  // across tones. In data symbols, discard the largest normalized bin for
+  // this time estimate only; the frame-wide estimate still sees CW energy.
+  std::array<double, 79> local{};
+  for (int s = 0; s < 79; ++s) {
+    if (!allowed(control)) return {};
+    std::array<double, 8> ratios{};
+    int const pilot = s % 36 < 7 ? costas[s / 36][s % 36] : -1;
+    int used = 0;
+    for (int k = 0; k < 8; ++k) {
+      if (!finite(observations[s][k])) return {};
+      if (k != pilot)
+        ratios[used++] = std::norm(static_cast<std::complex<double>>(observations[s][k])) /
+            noise.variance[k];
+    }
+    // The fourth order statistic discards the largest data bin implicitly.
+    // Debias it for unit exponential power: E[X_(4)] = sum of 1/i.
+    constexpr double pilot_median = 1.0 / 7 + 1.0 / 6 + 1.0 / 5 + 1.0 / 4;
+    constexpr double data_median = 1.0 / 8 + 1.0 / 7 + 1.0 / 6 + 1.0 / 5;
+    std::nth_element(ratios.begin(), ratios.begin() + 3, ratios.begin() + used);
+    local[s] = ratios[3] / (pilot >= 0 ? pilot_median : data_median);
+  }
+  auto const reference = median(local);
+  if (!std::isfinite(reference) || reference <= 0.0) return {};
+
+  auto const [min_tone, max_tone] = std::minmax_element(noise.variance.begin(), noise.variance.end());
+  bool has_burst = false;
+  for (int s = 0; s < 79; ++s) {
+    double const excess = std::max(0.0, local[s] / reference - 2.0);
+    local[s] = 1.0 + std::min(31.0, 0.75 * excess);
+    has_burst |= s % 36 >= 7 && local[s] >= 2.0;
+  }
+  if (!has_burst && *max_tone < 2.5 * *min_tone) return {};
+
+  // Under hypothesis k, only bin k gains signal variance S. Its likelihood
+  // relative to the all-noise hypothesis includes the normalizing determinant
+  // of that bin, which no longer cancels when the tone variances differ.
+  double const signal = noise.amplitude * noise.amplitude;
+  BitLikelihoods result{};
+  int data = 0;
+  for (int s = 0; s < 79; ++s) {
+    if (s % 36 < 7) continue;
+    if (!allowed(control)) return {};
+    std::array<double, 8> scores{};
+    for (int k = 0; k < 8; ++k) {
+      double const variance = noise.variance[k] * local[s];
+      double const power = std::norm(static_cast<std::complex<double>>(observations[s][k]));
+      scores[k] = (power / variance) * (signal / (signal + variance)) -
+          std::log1p(signal / variance);
+      if (!std::isfinite(scores[k])) return {};
+    }
+    append_symbol(result, data++, scores);
   }
   if (!allowed(control)) return {};
   return result;

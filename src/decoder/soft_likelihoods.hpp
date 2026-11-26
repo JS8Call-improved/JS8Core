@@ -42,4 +42,10 @@ std::optional<BitLikelihoods> make_soft_likelihoods(
     ToneObservations const&, DisturbanceModel const&, PilotChannel const* = nullptr,
     DecodeControl const* = nullptr);
 
+// Noncoherent likelihood with a separate variance per tone and a multiplier
+// for broadband bursts. Returns no retry when the disturbance is nearly uniform.
+std::optional<BitLikelihoods> make_adaptive_likelihoods(
+    ToneObservations const&, protocol::CostasArray const&, DisturbanceModel const&,
+    DecodeControl const* = nullptr);
+
 } // namespace js8core::decoder

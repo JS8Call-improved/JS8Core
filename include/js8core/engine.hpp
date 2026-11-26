@@ -110,6 +110,8 @@ struct EngineConfig {
   // Optional near-miss retries after the established decoder attempts.
   bool ldpc_rescue = true;
   bool aided_redemodulation = true;
+  // Retry with tone- and time-dependent noise estimates.
+  bool adaptive_whitening = true;
 };
 
 // Request to encode and transmit a user message.

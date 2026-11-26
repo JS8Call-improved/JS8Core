@@ -196,9 +196,16 @@ tries this under the optional decode budget only if the established pass-2
 metric fails to produce an accepted frame.
 Set `EngineConfig::coherent_likelihood` (or `DecodeParams::coherent_likelihood`
 for direct decoder calls) to `false` to use the established second-pass metric.
-Build with `-DJS8CORE_SOFT_DEMAPPER=OFF` to disable both soft demappers. See
+Build with `-DJS8CORE_SOFT_DEMAPPER=OFF` to disable soft demapping. See
 [the validation notes](docs/soft-likelihood-validation.md) for the noncoherent
 model and its paired benchmark results.
+
+Adaptive whitening is enabled by default. After the established decode attempts
+and last-try OSD, it can retry with a separate variance for each tone and less
+weight on symbols affected by broadband noise bursts. The retry uses the
+optional decode budget and reports CRC-valid frames without subtracting them
+from the audio. Set `EngineConfig::adaptive_whitening` or
+`DecodeParams::adaptive_whitening` to `false` to disable it independently.
 
 ## Adaptive interference cancellation
 
