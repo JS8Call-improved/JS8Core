@@ -49,8 +49,9 @@ the fork's other passes.
 
 ## Test audio
 
-48 sets of computer-made JS8 audio, the same as for the timing fixes
-(`docs/timing-fixes-validation.md` on that branch). One list of 700 messages
+48 sets of computer-made JS8 audio, the same as for #7 and #8
+(`docs/coarse-timing-bias-validation.md` and
+`docs/second-fine-timing-validation.md` on those branches). One list of 700 messages
 (100 each of heartbeat, CQ, contact reply, directed short text, relay,
 ragchew and weather report, from 40 stations) is built into frames by
 JS8Core's `build_message_frames` and sent at all four speeds and 8 levels
