@@ -204,8 +204,9 @@ New results from that residual have `Decoded::after_tracked_sic` set to true.
 Optional receive work (last-try OSD, symbol tracking, and tracked cancellation)
 yields to queued captures and a monotonic deadline set by
 `EngineConfig::optional_decode_budget_ms` (250 ms by default). Zero disables
-optional work without disabling mandatory decoding. Stale capture epochs and
-overwritten windows are canceled rather than delivered into a newer RX context.
+optional work without disabling mandatory decoding. Last-try OSD can report
+frames but does not use them for interference cancellation. Stale capture epochs
+and overwritten windows are canceled rather than delivered into a newer RX context.
 
 See [symbol-tracking validation](docs/symbol-tracking-validation.md) for the
 independent mathematical model, controls, tests, development measurements and

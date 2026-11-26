@@ -70,10 +70,8 @@ constexpr float kOsdMaxDiscrepancy = 0.065f;
 // wrong; this gap cuts how many reach it.
 constexpr float kOsdMinRunnerUpGap = 0.0025f;
 // A last-try answer is refused when a different frame was already reported
-// within 3 Hz and 0.05 s of it in this period: there it is the leftover of
-// that frame's subtraction read as a new frame. The same frame decoded again
-// at its own spot is still accepted, because its second subtraction helps the
-// decodes after it.
+// within 3 Hz and 0.05 s of it in this period: it may be a subtraction
+// residual misread as a new frame.
 constexpr float kLastTryNearHz = 3.0f;
 constexpr float kLastTryNearSeconds = 0.05f;
 
@@ -215,20 +213,22 @@ class ChannelDecoder {
     }
     return near;
   }
-  std::optional<Frame> attempt_decode(bool sync_stats, bool subtract,
-                                      float& frequency, float& offset,
-                                      int& hard_errors, float& snr,
-                                      int& rescue_budget, EventEmitter emit,
-                                      SymbolTracking tracking = SymbolTracking::Disabled,
-                                      int received_samples = 0,
-                                      std::optional<decoder::TrackedTrajectory>* trajectory = nullptr,
-                                      DecodeControl const* control = nullptr);
+  struct AttemptResult {
+    Frame frame;
+    bool subtracted;
+  };
+  std::optional<AttemptResult> attempt_decode(
+      bool sync_stats, bool subtract, float& frequency, float& offset,
+      int& hard_errors, float& snr, int& rescue_budget, EventEmitter emit,
+      SymbolTracking tracking = SymbolTracking::Disabled, int received_samples = 0,
+      std::optional<decoder::TrackedTrajectory>* trajectory = nullptr,
+      DecodeControl const* control = nullptr);
 
   // --- Signal reconstruction -----------------------------------------------
 
   std::vector<std::complex<float>> make_reference(std::array<int, kChannelSymbols> const& tones,
                                                   float frequency);
-  void subtract_reference(std::vector<std::complex<float>> const& reference,
+  bool subtract_reference(std::vector<std::complex<float>> const& reference,
                           float offset);
 
   // --- Buffers --------------------------------------------------------------
@@ -683,11 +683,12 @@ std::vector<Candidate> ChannelDecoder<Mode>::find_candidates(int low_hz,
 }
 
 template <typename Mode>
-std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
+auto ChannelDecoder<Mode>::attempt_decode(
     bool sync_stats, bool subtract, float& frequency, float& offset,
     int& hard_errors, float& snr, int& rescue_budget, EventEmitter emit,
     SymbolTracking tracking, int received_samples,
-    std::optional<decoder::TrackedTrajectory>* trajectory, DecodeControl const* control) {
+    std::optional<decoder::TrackedTrajectory>* trajectory, DecodeControl const* control)
+    -> std::optional<AttemptResult> {
   if (trajectory) trajectory->reset();
   auto allowed = [&] {
     return !control || (!control->is_canceled() &&
@@ -1000,13 +1001,16 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
       emit(event);
     }
 
-    std::string const text = decoder::decode_message(payload);
+    std::string text = decoder::decode_message(payload);
     int const type = (payload[72] << 2) | (payload[73] << 1) | payload[74];
 
     std::array<int, kChannelSymbols> tones{};
     legacy_encode(type, kCostas, text.data(), tones.data());
 
-    if (subtract) subtract_reference(make_reference(tones, frequency), refined_offset);
+    // OSD's best guess can pass the CRC by chance. Report it, but do not let
+    // it change the residual seen by later ordinary or tracked attempts.
+    bool const subtracted = subtract && pass != 6 &&
+        subtract_reference(make_reference(tones, frequency), refined_offset);
 
     float signal_power = 0.0f;
     for (std::size_t i = 0; i < tones.size(); ++i) {
@@ -1021,7 +1025,7 @@ std::optional<Frame> ChannelDecoder<Mode>::attempt_decode(
 
     // Never return a cancellation trajectory for a failed or non-CRC attempt.
     if (trajectory) *trajectory = fitted_trajectory;
-    return Frame{type, text};
+    return AttemptResult{Frame{type, std::move(text)}, subtracted};
   }
 
   return std::nullopt;
@@ -1052,14 +1056,14 @@ std::vector<std::complex<float>> ChannelDecoder<Mode>::make_reference(
 }
 
 template <typename Mode>
-void ChannelDecoder<Mode>::subtract_reference(
+bool ChannelDecoder<Mode>::subtract_reference(
     std::vector<std::complex<float>> const& reference, float offset) {
   int const start = static_cast<int>(offset * 12000.0f);
   std::size_t const reference_start =
       start < 0 ? static_cast<std::size_t>(-start) : 0;
   std::size_t const signal_start = start > 0 ? static_cast<std::size_t>(start) : 0;
 
-  if (reference_start >= reference.size() || signal_start >= samples_.size()) return;
+  if (reference_start >= reference.size() || signal_start >= samples_.size()) return false;
 
   std::size_t const count =
       std::min(reference.size() - reference_start, samples_.size() - signal_start);
@@ -1092,6 +1096,7 @@ void ChannelDecoder<Mode>::subtract_reference(
     samples_[signal_start + i] -=
         2.0f * std::real(subtract_work_[i] * reference[reference_start + i]);
   }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,7 +1159,7 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
     prepare_baseband();
 
     bool const subtract = pass < 3;
-    bool improved = false;
+    bool changed = false;
 
     for (auto candidate : candidates) {
       if (control.is_canceled()) break;
@@ -1163,16 +1168,16 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
       int hard_errors = -1;
       float snr = 0.0f;
 
-      auto frame = attempt_decode(data.params.syncStats, subtract, frequency,
-                                  offset, hard_errors, snr, rescue_budget, emit,
-                                  SymbolTracking::Disabled, 0, nullptr, &control);
-      if (!frame) continue;
+      auto result = attempt_decode(data.params.syncStats, subtract, frequency,
+                                   offset, hard_errors, snr, rescue_budget, emit,
+                                   SymbolTracking::Disabled, 0, nullptr, &control);
+      if (!result) continue;
+      changed |= result->subtracted;
 
       int const rounded_snr = static_cast<int>(std::round(snr));
-      auto [slot, inserted] = decoded.try_emplace(std::move(*frame), rounded_snr);
+      auto [slot, inserted] = decoded.try_emplace(std::move(result->frame), rounded_snr);
       if (!inserted && slot->second >= rounded_snr) continue;
 
-      improved = true;
       if (!inserted) slot->second = rounded_snr;
 
       emit(events::Decoded{data.params.utc,
@@ -1186,7 +1191,9 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
       reported_.push_back({frequency, offset, slot->first.text});
     }
 
-    if (!improved) break;
+    // Another pass is only useful if the audio changed. A BP decode can
+    // subtract even when it duplicates a frame previously reported by OSD.
+    if (!changed) break;
   }
 
   // Run optional tracking only after every established SIC pass. Its separate
@@ -1224,15 +1231,15 @@ std::size_t ChannelDecoder<Mode>::operator()(dec_data const& data, int position,
           float offset = candidate.offset, snr = 0.0f;
           int hard_errors = -1;
           std::optional<decoder::TrackedTrajectory> trajectory;
-          auto frame = attempt_decode(data.params.syncStats, false, frequency, offset,
-                                      hard_errors, snr, tracking_rescue_budget, emit,
-                                      data.params.symbol_tracking, count,
-                                      data.params.tracked_sic && !after_cancellation ? &trajectory : nullptr,
-                                      &control);
-          if (!frame) continue;
-          if (decoded.contains(*frame)) break;
+          auto result = attempt_decode(data.params.syncStats, false, frequency, offset,
+                                       hard_errors, snr, tracking_rescue_budget, emit,
+                                       data.params.symbol_tracking, count,
+                                       data.params.tracked_sic && !after_cancellation ? &trajectory : nullptr,
+                                       &control);
+          if (!result) continue;
+          if (decoded.contains(result->frame)) break;
           int const rounded_snr = static_cast<int>(std::round(snr));
-          auto [slot, inserted] = decoded.try_emplace(std::move(*frame), rounded_snr);
+          auto [slot, inserted] = decoded.try_emplace(std::move(result->frame), rounded_snr);
           if (!inserted) break;
           events::Decoded event{data.params.utc, rounded_snr, offset - Mode::start_seconds,
                                 frequency, slot->first.text, slot->first.type,

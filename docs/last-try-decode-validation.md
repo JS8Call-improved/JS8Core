@@ -10,8 +10,14 @@ attempts (`--tracking`) do not use the last try.
 In the engine, the last try now shares `EngineConfig::optional_decode_budget_ms`
 with tracking and tracked cancellation. It yields to queued captures or an
 expired deadline; a search interrupted by either condition cannot report a
-frame or subtract it from the audio. The validation results below used the
-offline decoder without the engine's optional-work deadline.
+frame. OSD results are report-only: they never subtract from the audio or
+trigger another cancellation pass. This prevents a CRC-valid false positive
+from masking other signals, but also means that an OSD-only recovery cannot
+uncover a weaker signal by cancellation. A frame independently recovered by
+belief propagation is still eligible for subtraction.
+
+The historical measurements below used the original offline implementation,
+which allowed OSD subtraction and had no engine optional-work deadline.
 
 ## What the last try does
 

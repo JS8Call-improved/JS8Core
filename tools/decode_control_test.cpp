@@ -4,9 +4,11 @@
 #include "src/decoder/tracked_reference.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <random>
 #include <stdexcept>
+#include <tuple>
 
 using namespace js8core;
 
@@ -26,11 +28,16 @@ int main() {
   state.samples.resize(720000);
   state.params.nfa = 1400; state.params.nfb = 1800; state.params.nfqso = 1500;
   state.params.nsubmodes = 1 << 4; state.params.kszI = 48000;
-  auto run = [](DecodeState const& state, DecodeControl const& control) {
+  using CandidateTrace = std::vector<std::tuple<float, float, int>>;
+  auto run = [](DecodeState const& state, DecodeControl const& control,
+                CandidateTrace* candidates = nullptr) {
     std::pair<std::vector<events::Decoded>, events::DecodeFinished> result;
     decode_with_control(state, [&](auto const& event) {
       if (auto d = std::get_if<events::Decoded>(&event)) result.first.push_back(*d);
       if (auto f = std::get_if<events::DecodeFinished>(&event)) result.second = *f;
+      if (auto s = std::get_if<events::SyncState>(&event);
+          candidates && s && s->kind == events::SyncState::Kind::Candidate)
+        candidates->emplace_back(s->frequency, s->dt, s->sync.candidate);
     }, control);
     return result;
   };
@@ -86,13 +93,14 @@ int main() {
   osd_state.params = state.params;
   osd_state.params.nfa = 1470;
   osd_state.params.nfb = 1740;
+  osd_state.params.syncStats = true;
   osd_state.params.symbol_tracking = SymbolTracking::Disabled;
   osd_state.samples = test::render_tracking_audio(
       std::array{test::TrackingWaveform(weak), test::TrackingWaveform(strong)}, 12000, 48000);
   // Use the generator's bits directly so the noise is identical across standard libraries.
-  std::mt19937 rng(71);
+  std::mt19937 rng(43);
   for (auto& sample : osd_state.samples) {
-    int const noise = (static_cast<int>(rng() >> 16) - 32768) * 44000 / 65536;
+    int const noise = (static_cast<int>(rng() >> 16) - 32768) * 51000 / 65536;
     sample = static_cast<std::int16_t>(std::clamp(sample + noise, -32768, 32767));
   }
   osd_state.samples.resize(720000);
@@ -102,16 +110,22 @@ int main() {
       return frame.data == text && frame.type == type;
     });
   };
-  auto osd_baseline = run(osd_state, {});
+  CandidateTrace osd_candidates, bp_candidates;
+  auto osd_baseline = run(osd_state, {}, &osd_candidates);
   check(contains(osd_baseline, weak_frame, 4) && contains(osd_baseline, "HELLO-WORLD-", 2) &&
         !osd_baseline.second.optional_work_skipped && !osd_baseline.second.canceled,
         "admitted OSD recovers the weak frame alongside the ordinary frame");
   DecodeControl osd_limit;
   osd_limit.optional_allowed = [] { return false; };
-  auto osd_denied = run(osd_state, osd_limit);
+  auto osd_denied = run(osd_state, osd_limit, &bp_candidates);
   check(!contains(osd_denied, weak_frame, 4) && contains(osd_denied, "HELLO-WORLD-", 2) &&
         osd_denied.second.optional_work_skipped && !osd_denied.second.canceled,
         "OSD entry denial does not stop ordinary decoding");
+  check(std::count_if(bp_candidates.begin(), bp_candidates.end(), [](auto const& candidate) {
+          return std::abs(std::get<0>(candidate) - 1500.0f) < 5.0f;
+        }) >= 2, "ordinary subtraction leads to another search of the weak candidate");
+  check(osd_candidates == bp_candidates,
+        "reporting the weak OSD frame leaves subsequent candidate searches unchanged");
   int osd_probes = 0;
   osd_limit.optional_allowed = [&] { return ++osd_probes != 16; };
   auto osd_interrupted = run(osd_state, osd_limit);
