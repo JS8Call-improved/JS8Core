@@ -31,7 +31,7 @@ jobs:
           js8core js8core-version-test js8core-crc-test js8core-varicode-test js8core-policy-test js8core-clock-math-test
           verify_jsc_roundtrip js8core-vox-test js8core-fractional-rx-test
           js8core-tracking-waveform-test js8core-tracking-baseline
-          js8core-soft-likelihood-test js8core-coherent-costas-test js8core-coherent-likelihood-test js8core-near-miss-test
+          js8core-soft-likelihood-test js8core-coherent-costas-test js8core-coherent-likelihood-test js8core-near-miss-test js8core-spread-reading-test
           js8core-symbol-tracking-test
           js8core-tracked-extraction-test
           js8core-tracked-reference-test
