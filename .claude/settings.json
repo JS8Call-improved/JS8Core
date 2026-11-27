@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "deny": [
+      "Edit(.claude/**)",
+      "Write(.claude/**)",
+      "Bash(git commit)",
+      "Bash(git commit *)",
+      "Bash(git push)",
+      "Bash(git push *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/block-git-push.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
