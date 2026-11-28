@@ -11,3 +11,11 @@ build_dbg/
 build-review/
 /build-symbol-tracking/
 .claude/settings.local.json
+
+# macOS & Xcode artifacts
+.DS_Store
+*.xcworkspace
+*.xcuserdata/
+xcuserdata/
+DerivedData/
+*.dSYM/
