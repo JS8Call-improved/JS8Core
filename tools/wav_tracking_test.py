@@ -50,8 +50,11 @@ def main():
         silence.write_bytes(riff(fmt, chunk(b"data", bytes(30 * 12000 * 2))))
         for mode in ("A", "E"):
             default = run(["--records", mode, silence])
-            if default.stdout or "PAIR\t" in default.stderr:
-                raise AssertionError("default record output changed or silence decoded")
+            # Candidate paths now always run by default, so a baseline-only
+            # invocation still emits PAIR summaries; silence must still yield no
+            # decoded frames regardless of which features are enabled.
+            if default.stdout:
+                raise AssertionError("silence decoded")
             for tracking in ("disabled", "frequency", "timing", "both"):
                 result = run(["--records", "--tracking", tracking, mode, silence])
                 if result.stdout:
