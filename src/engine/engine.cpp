@@ -210,6 +210,7 @@ class Js8EngineImpl final : public Js8Engine {
     ring_.params.aided_redemodulation = config_.aided_redemodulation;
     ring_.params.adaptive_whitening = config_.adaptive_whitening;
     ring_.params.quadratic_phase = config_.quadratic_phase;
+    ring_.params.spread_reading = config_.spread_reading;
 
     align_ring(aligned_now());
 

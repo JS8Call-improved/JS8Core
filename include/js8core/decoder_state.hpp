@@ -50,6 +50,8 @@ struct DecodeParams {
   bool adaptive_whitening = true;
   // Retry coherent decoding with a pilot-validated carrier drift estimate.
   bool quadratic_phase = true;
+  // Retry fast-fading frames with neighbour-tone (spread) likelihoods.
+  bool spread_reading = true;
 };
 
 struct DecodeState {
