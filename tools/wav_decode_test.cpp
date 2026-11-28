@@ -116,9 +116,9 @@ bool same_frame(events::Decoded const& a, events::Decoded const& b) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  bool records = false, wrap = false, valid = true, tracked_sic = false, deep_sync = false;
-  bool adaptive_sic = false;
-  SymbolTracking tracking = SymbolTracking::Disabled;
+  bool records = false, wrap = false, valid = true, tracked_sic = true, deep_sync = true;
+  bool adaptive_sic = true;
+  SymbolTracking tracking = SymbolTracking::Both;
   int mode_arg = 1;
   while (mode_arg < argc && std::string_view(argv[mode_arg]).starts_with("--") && valid) {
     std::string_view option(argv[mode_arg++]);
@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: %s [--records] [--tracking disabled|frequency|timing|both] "
                  "[--wrap] [--tracked-sic] [--adaptive-sic] [--deep-sync] "
-                 "<mode A|E> <file.wav>...\n", argv[0]);
+                 "<mode A|E> <file.wav>... (tracking, tracked_sic, adaptive_sic, deep_sync default on)\n", argv[0]);
     return 2;
   }
 
@@ -158,8 +158,11 @@ int main(int argc, char** argv) {
     }
 
     DecodeState state;
-    // Preserve the recorder/comparator's disabled baseline regardless of the
-    // production defaults. Explicit CLI switches select the candidate path.
+    // Keep the recorder/comparator's disabled baseline regardless of the
+    // production defaults. The regression treats it as the fixed reference
+    // that the enabled candidate paths below must preserve and against which
+    // the pinned decode counts are checked; enabling the features is handled
+    // by the CLI defaults above, which always exercise the candidate paths.
     state.params.symbol_tracking = SymbolTracking::Disabled;
     state.params.tracked_sic = false;
     state.params.adaptive_sic = false;
