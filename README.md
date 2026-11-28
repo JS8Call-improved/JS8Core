@@ -219,8 +219,9 @@ The spread reading retry is enabled by default for fast fading, where Doppler
 spread moves tone power onto neighbouring tones. It runs only when the Costas
 pilots show that spread, scores each tone together with its two neighbours,
 and tries belief propagation and then OSD on those likelihoods. It runs under
-the optional decode budget after adaptive whitening and reports CRC-valid
-frames without subtracting them from the audio. Set
+the optional decode budget on ordinary attempts (not tracked or deep sync
+attempts), after every other retry has failed, and reports CRC-valid frames
+without subtracting them from the audio. Set
 `EngineConfig::spread_reading` or `DecodeParams::spread_reading` to `false` to
 disable the retry. See [the validation notes](docs/spread-reading-validation.md).
 

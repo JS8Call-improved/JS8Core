@@ -40,9 +40,12 @@ is the same score as the noncoherent soft reading pass 2 uses
 
 ## Where it runs
 
-After the ordinary passes, the last try and the adaptive whitening retry have
-failed for a candidate, and before the LDPC rescue, aided re-demodulation and
-quadratic phase retries.
+Last, after the ordinary passes, the last try, the adaptive whitening retry,
+the LDPC rescue, aided re-demodulation and the quadratic phase retry have all
+failed for a candidate. The LDPC rescue's results are subtracted from the
+audio; a spread result reported ahead of it would leave that signal in the
+audio. Aided re-demodulation replaces the tone magnitudes when it runs; the
+spread reading uses the magnitudes from before it.
 
 | Gate | Value |
 |---|---|
@@ -54,19 +57,24 @@ quadratic phase retries.
 | Costas tones read right by the spread reading | at least `kSpreadMinSync` = 9 of 21 |
 
 - Belief propagation runs first. If it fails, ordered statistics decoding
-  runs on the same reading with the last try's limits, on untracked attempts
-  only.
+  runs on the same reading, with its own limits (below).
 - Both results must pass the last try's checks: CRC, hard-error limits, a
   readable frame, and no different frame nearby.
-- Results are not subtracted from the audio, as with the other retries.
-- Deep sync attempts reach the retry as they reach the adaptive whitening
-  retry, under the optional decode budget.
+- Results are not subtracted from the audio, as with the other report-only
+  retries.
+- Ordinary attempts only. Tracked attempts (`symbol_tracking`) and deep sync
+  attempts get no `RetryBudget`, so none of the budgeted retries (LDPC
+  rescue, aided re-demodulation, adaptive whitening, quadratic phase, spread
+  reading) runs on them. The `--tracking both` and `--deep-sync` results
+  below come from the ordinary attempts in those runs.
 
 ## How the limits were picked
 
 On the tuning sets `itu_hm_s` and `itu_ld_s` (800 frames, below), the noise
 sets of all four speeds, and the Slow drift sets `rs_flat_d` and `rs_crowd_d`,
-with a test copy of this branch where each limit could be set.
+with a test copy of this branch where each limit could be set. The signal
+minimum, Costas gate and tries per decode were set on the previous version
+of this branch (retry ahead of the LDPC rescue); the OSD limits on this one.
 
 - **Signal minimum.** With no minimum, the retry ran 17 times on the
   noise-only sets (`noise4`, `bnoise`, `cnoise`, `enoise`: 1,600 files), every
@@ -82,12 +90,35 @@ with a test copy of this branch where each limit could be set.
   decodes 7,452, with 32: 7,593, with 64: 7,617, unlimited: 7,618. Decode
   time for the set was 31 to 33 s in all four. On `rs_flat_d`, the most
   tries in one decode was 14.
+- **OSD limits** (`kSpreadOsdMaxDiscrepancy` = 0.085,
+  `kSpreadOsdMinRunnerUpGap` = 0.00375, both as a share of the reading's total
+  |LLR|). A test copy logged every OSD answer, before its limits, on the 48
+  sets below and the four noise-only sets: 45,079 answers from the spread
+  step and 311,546 from the last try. An answer within the limits whose hard
+  errors pass reaches the CRC check; if it is not the sent frame, it has about
+  a 1 in 4,096 chance of passing as a wrong frame (a "chance" below). Rule:
+  the most right frames with no more chances per right frame than the last
+  try at its own limits (0.065, 0.0025). Picked on the even-numbered files of
+  each set (grid: discrepancy 0.020 to 0.100 in steps of 0.005, gap 0 to
+  0.02 in steps of 0.00125), checked on the odd-numbered files:
+
+| OSD answers within the limits | Files | Right frames | Chances | Chances per right frame | Wrong frames seen |
+|---|---|---:|---:|---:|---:|
+| Last try, 0.065 / 0.0025 | all | 33,508 | 41,323 | 1.23 | 8 |
+| Spread step, last try's limits (previous version) | all | 5,444 | 9,166 | 1.68 | 2 |
+| Spread step, 0.085 / 0.00375 | even (picked) | 2,475 | 2,590 | 1.05 | 0 |
+| Spread step, 0.085 / 0.00375 | odd (check) | 2,619 | 2,412 | 0.92 | 0 |
+| Spread step, 0.085 / 0.00375 | all | 5,094 | 5,002 | 0.98 | 0 |
+
+  The new limits cut the spread step's chances by 45% for 6% fewer right
+  answers. The right frames counted here are the step's own answers; frames
+  gained over `c4c6f53` are in the results below.
 
 ## Regression test
 
 `tools/spread_reading_test.cpp` (`js8core-spread-reading-test`, in CTest and
 the CI build list). It builds a Normal-speed frame in code through a 10 Hz
-Gaussian-Doppler fading channel (32 paths, seed 1) with white noise, and
+Gaussian-Doppler fading channel (32 paths, seed 2) with white noise, and
 checks:
 
 - the spread reading decodes the frame;
@@ -96,9 +127,13 @@ checks:
 - noise alone gives no frame;
 - the same frame without fading decodes with the optional budget denied.
 
-Seed 1 was picked from seeds 1 to 20 because it decodes only with the spread
-reading at amplitudes 700, 1000 and 1500; the test uses 1000. It passes in
-Debug and Release builds.
+The random draws are made in the test from the raw 32-bit output of
+`std::mt19937`, which the C++ standard fixes: uniform values from one word,
+Gaussian values by the Box-Muller method. `std::normal_distribution` and
+`std::uniform_real_distribution` are not used, because their output differs
+between standard libraries. Seed 2 is the lowest of seeds 1 to 20 that
+decodes only with the spread reading at amplitudes 700, 1000 and 1500 (9 of
+the 20 seeds do); the test uses 1000.
 
 ## Test audio
 
@@ -122,7 +157,8 @@ per set.
 The frame text in these sets is random characters. About a third of random
 frames are not readable by any unpacker, and the retry, like the last try and
 the other retries, refuses unreadable frames. With that check switched off in
-a test copy, the tuning sets give 269 of 800 instead of 175. Real JS8 frames
+a test copy of the previous version, the tuning sets gave 269 of 800 instead
+of 175. Real JS8 frames
 are always readable, so on real traffic the check costs nothing.
 
 **48 real-traffic sets**, the same as in `docs/second-fine-timing-validation.md`:
@@ -150,22 +186,25 @@ in every row, both builds.
 
 | Sets | Frames | `c4c6f53` | This branch |
 |---|---:|---:|---:|
-| Normal, 10 Hz, tuning (`itu_hm_s`, `itu_ld_s`) | 800 | 0 | 175 |
-| Normal, 10 Hz, test (`_f`, `_g`) | 1,600 | 1 | 359 |
+| Normal, 10 Hz, tuning (`itu_hm_s`, `itu_ld_s`) | 800 | 0 | 167 |
+| Normal, 10 Hz, test (`_f`, `_g`) | 1,600 | 1 | 345 |
 | Normal, 30 Hz (`itu_hd_s`) | 400 | 0 | 0 |
-| Fast, 10 Hz (`bhm_f`, `bld_f`) | 800 | 148 | 306 |
+| Fast, 10 Hz (`bhm_f`, `bld_f`) | 800 | 148 | 304 |
 | Turbo, 10 Hz (`chm_f`, `cld_f`) | 800 | 590 | 590 |
 | Noise only (`noise4`, `bnoise`, `cnoise`) | 4,800 chances | 0 wrong | 0 wrong |
 
-By level, all six Normal 10 Hz sets (600 frames per level): 0 dB 1 → 200,
--4 dB 0 → 168, -8 dB 0 → 129, -12 dB 0 → 37. Fast 10 Hz (200 frames per
-level): 0 dB 61 → 112, -4 dB 47 → 86, -8 dB 34 → 86, -12 dB 6 → 22.
+By level, all six Normal 10 Hz sets (600 frames per level): 0 dB 1 → 194,
+-4 dB 0 → 164, -8 dB 0 → 121, -12 dB 0 → 33. Fast 10 Hz (200 frames per
+level): 0 dB 61 → 112, -4 dB 47 → 86, -8 dB 34 → 85, -12 dB 6 → 21.
 
-- With `--tracking both`: Normal the same as above; Fast 152 → 310; Turbo
+- With `--tracking both`: Normal the same as above; Fast 152 → 308; Turbo
   593 in both builds; 0 wrong.
-- With `--deep-sync`: Normal the same; Fast 149 → 307; Turbo 602 in both
+- With `--deep-sync`: Normal the same; Fast 149 → 305; Turbo 602 in both
   builds; 0 wrong.
 - With `--adaptive-sic`: the same as without it; 0 wrong.
+- The previous version of this branch (OSD step with the last try's limits,
+  retry ahead of the LDPC rescue) gave 175, 359, 306 and 590 in the first
+  rows.
 
 ## Results on the 48 sets, tracking disabled
 
@@ -174,21 +213,22 @@ level): 0 dB 61 → 112, -4 dB 47 → 86, -8 dB 34 → 86, -12 dB 6 → 22.
 | Normal | 105,226 | 105,226 (+0.00%) | 37,463 | 37,463 (+0.00%) | 1 → 1 |
 | Fast | 90,422 | 90,422 (+0.00%) | 31,305 | 31,305 (+0.00%) | 1 → 1 |
 | Turbo | 62,259 | 62,259 (+0.00%) | 20,445 | 20,445 (+0.00%) | 1 → 1 |
-| Slow | 108,862 | 110,891 (+1.86%) | 38,658 | 39,238 (+1.50%) | 3 → 4 |
-| **All** | **366,769** of 718,880 | **368,798 (+0.55%)** | **127,871** of 268,800 | **128,451 (+0.45%)** | **6 → 7** |
+| Slow | 108,862 | 110,750 (+1.73%) | 38,658 | 39,211 (+1.43%) | 3 → 3 |
+| **All** | **366,769** of 718,880 | **368,657 (+0.51%)** | **127,871** of 268,800 | **128,424 (+0.43%)** | **6 → 6** |
 
-- 2,029 right frames decoded only by this branch, all Slow; 0 decoded only
+- 1,888 right frames decoded only by this branch, all Slow; 0 decoded only
   by `c4c6f53`.
-- The gain is all on the six Slow sets with drift: `rs_flat_d` +478 frames,
-  `rs_flat_dc` +437, `rs_crowd_d` +391, `rs_crowd_dc` +354, `rs_fade_dc`
-  +192, `rs_fade_d` +177.
-- The new wrong frame: `rs_flat_d`, file `S-18_250.wav` (Slow, no fading,
-  drift, sent at -18 dB), frame `674e6d65716c61444e37736e` at 1470.25 Hz,
-  reported -28 dB. It comes from the OSD step on the spread reading, at the
-  frequency of a sent frame (1470.09 Hz) that neither build decodes.
-- Without the OSD step, that file gives no wrong frame, but the gains shrink:
-  Slow drift sets 383 frames instead of 2,029, Normal 10 Hz test sets 146
-  instead of 359, Fast 10 Hz 265 instead of 306. This branch keeps the step.
+- The gain is all on the six Slow sets with drift: `rs_flat_d` +437 frames,
+  `rs_flat_dc` +414, `rs_crowd_d` +364, `rs_crowd_dc` +342, `rs_fade_dc`
+  +170, `rs_fade_d` +161.
+- No new wrong frame. The previous version of this branch added one
+  (`rs_flat_d`, `S-18_250.wav`, `674e6d65716c61444e37736e`, from the OSD step
+  at the last try's limits); the step's own limits refuse it.
+- Steps from the previous version (2,029 gained, wrong 6 → 7): running the
+  retry last, with the OSD step still at the last try's limits, gave 2,015
+  gained and the same wrong frame; the OSD step's own limits then give 1,888
+  gained and no wrong frame (175 frames fewer, 48 more, against the retry
+  run last with the old limits).
 
 ## Results with tracking on
 
@@ -200,10 +240,11 @@ The 12 sets with both drift and clock offset (`_dc`), decoded with
 | Normal | 26,085 | 26,085 (+0.00%) | 9,275 | 9,275 (+0.00%) | 1 → 1 |
 | Fast | 22,399 | 22,399 (+0.00%) | 7,754 | 7,754 (+0.00%) | 1 → 1 |
 | Turbo | 15,249 | 15,249 (+0.00%) | 4,978 | 4,978 (+0.00%) | 1 → 1 |
-| Slow | 22,125 | 23,048 (+4.17%) | 7,483 | 7,725 (+3.23%) | 1 → 1 |
-| **All** | **85,858** of 179,720 | **86,781 (+1.08%)** | **29,490** of 67,200 | **29,732 (+0.82%)** | **4 → 4** |
+| Slow | 22,125 | 22,995 (+3.93%) | 7,483 | 7,719 (+3.15%) | 1 → 1 |
+| **All** | **85,858** of 179,720 | **86,728 (+1.01%)** | **29,490** of 67,200 | **29,726 (+0.80%)** | **4 → 4** |
 
-923 right frames gained (all Slow), 0 lost.
+870 right frames gained (all Slow), 0 lost. These come from the ordinary
+attempts that run beside tracking; tracked attempts do not reach the retry.
 
 ## Processor time
 
@@ -214,16 +255,15 @@ depend on other load on the machine.
 
 | Set (files) | Speed | Instructions, tracking off | Processor time, tracking off | Instructions, `--tracking both` |
 |---|---|---:|---:|---:|
-| 60 stations per file (25) | Normal | 0.93 | 0.94 | 1.07 |
-| 37 stations per file (25) | Fast | 1.00 | 0.98 | 1.00 |
-| 19 stations per file (25) | Turbo | 1.00 | 0.97 | 1.00 |
-| 60 stations per file (30) | Slow | 1.00 | 1.00 | 1.00 |
-| 4 stations per file (15) | Normal | 1.00 | 1.02 | 1.00 |
-| Noise only (20) | Normal | 1.00 | 1.06 | 1.00 |
+| 60 stations per file (30) | Normal | 1.00 | 1.01 | 1.00 |
+| 37 stations per file (30) | Fast | 1.00 | 0.99 | 1.00 |
+| 19 stations per file (30) | Turbo | 1.00 | 1.00 | 1.00 |
+| 60 stations per file (30) | Slow | 1.00 | 0.96 | 1.00 |
+| 4 stations per file (20) | Normal | 1.00 | 1.03 | 1.00 |
+| Noise only (20) | Normal | 1.00 | 0.99 | 1.00 |
 
-Ratios to `c4c6f53`. On the 60-station Normal set, this branch decodes 314
-right frames against 311 with tracking off, and 311 against 314 with
-`--tracking both`; both builds decode the same frames on the other sets.
+Ratios to `c4c6f53`. Both builds decode the same right and wrong frames on
+these sets, with and without tracking.
 
 ## The repository's own checks
 
