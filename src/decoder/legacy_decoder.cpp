@@ -94,18 +94,24 @@ constexpr float kOsdMinRunnerUpGap = 0.0025f;
 // to noise) measured separately for the centre and the neighbours on the 21
 // known Costas tones: the detector for a Rayleigh-faded tone of known spread
 // (Q65's fast-fading decoder uses the same form). Bits come from all 8 tone
-// scores. It is a budgeted retry after the ordinary passes (kSpreadBudget
+// scores. It is a budgeted retry after every other retry (kSpreadBudget
 // tries per decode), and its results are report-only. It runs only when the
 // Costas tones show spread (neighbour signal at least kSpreadMinShare of the
 // centre's), the centre signal is at least kSpreadMinSignal times the noise
 // (on noise-only audio every candidate that reached it was below 4), and at
 // least kSpreadMinSync of the 21 Costas tones are read right by the spread
-// reading. Belief propagation runs first; on untracked attempts ordered
-// statistics decoding follows with the same limits as the last try.
+// reading. Belief propagation runs first; ordered statistics decoding follows
+// with its own limits. Those were set on the spread step's own answers (real
+// traffic sets and noise, picked on half the files, checked on the other
+// half) so that answers reaching the CRC check without being the sent frame
+// (each about 1 in 4,096 of a wrong frame) are no more per right frame than
+// the last try's: 0.92 against 1.23 on the check half.
 constexpr float kSpreadMinShare = 0.2f;
 constexpr double kSpreadMinSignal = 4.0;
 constexpr int kSpreadMinSync = 9;
 constexpr int kSpreadBudget = 64;
+constexpr float kSpreadOsdMaxDiscrepancy = 0.085f;
+constexpr float kSpreadOsdMinRunnerUpGap = 0.00375f;
 // A last-try answer that passes the CRC check is still refused when no
 // unpacker reads it: fast data when type bit 4 is set, else data, heartbeat,
 // compound or directed (JS8Call-improved's order). Such a frame would be shown
@@ -1216,8 +1222,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
                                               control);
     if (auto result = report()) return result;
 
-    // Ordered statistics decoding of the spread reading, untracked attempts
-    // only, with the last try's limits.
+    // Ordered statistics decoding of the spread reading, with its own limits.
     if (tracking != SymbolTracking::Disabled || !optional_allowed()) return std::nullopt;
     float evidence = 0.0f;
     for (float value : spread_llr) evidence += std::abs(value);
@@ -1229,14 +1234,13 @@ auto ChannelDecoder<Mode>::attempt_decode(
     hard_errors = decoder::ordered_statistics_decode(spread_llr, payload, codeword, kOsdOrder,
                                                      &discrepancy, true, &runner_up, &refined,
                                                      control);
-    if (hard_errors < 0 || discrepancy > kOsdMaxDiscrepancy * evidence ||
-        runner_up - discrepancy < kOsdMinRunnerUpGap * evidence) {
+    if (hard_errors < 0 || discrepancy > kSpreadOsdMaxDiscrepancy * evidence ||
+        runner_up - discrepancy < kSpreadOsdMinRunnerUpGap * evidence) {
       hard_errors = -1;
       return std::nullopt;
     }
     return report();
   };
-  if (auto result = spread_retry()) return result;
 
   auto quadratic_retry = [&]() -> std::optional<AttemptResult> {
 #if !defined(JS8CORE_DISABLE_SOFT_DEMAPPER)
@@ -1267,7 +1271,19 @@ auto ChannelDecoder<Mode>::attempt_decode(
 #endif
   };
 
-  if (!source_pass || !optional_allowed()) return quadratic_retry();
+  // The spread reading runs last, after the LDPC rescue, aided
+  // re-demodulation and quadratic phase retry: the rescue's results are
+  // subtracted, and a spread result reported first would keep its signal in
+  // the audio. A rejected aided attempt replaces the working magnitudes; the
+  // spread reading uses the original ones.
+  std::optional<std::array<std::array<float, kChannelSymbols>, kToneRows>> unaided_tone_power;
+  auto last_retries = [&]() -> std::optional<AttemptResult> {
+    if (auto result = quadratic_retry()) return result;
+    if (unaided_tone_power) tone_power = *unaided_tone_power;
+    return spread_retry();
+  };
+
+  if (!source_pass || !optional_allowed()) return last_retries();
   if (retry_budget->rescue > 0) {
     --retry_budget->rescue;
     auto const seed_llrs = near_miss_llrs;
@@ -1289,7 +1305,7 @@ auto ChannelDecoder<Mode>::attempt_decode(
   if (retry_budget->redemodulation <= 0 || near_miss.failed_checks > max_aided_checks ||
       best_time < 0 || best_time + last_data_end > demodulation_limit ||
       best_time + Mode::payload_samples > received_limit || !optional_allowed())
-    return quadratic_retry();
+    return last_retries();
   --retry_budget->redemodulation;
 
   // Replay coarse extraction from the actual FFT center, including the
@@ -1303,7 +1319,8 @@ auto ChannelDecoder<Mode>::attempt_decode(
   auto const aided = decoder::redemodulate_near_miss(
       std::span(channel_).first(received_limit), best_time, Mode::downsample_sps,
       down_rate, near_miss.bits, kCostas, control);
-  if (aided.samples.empty()) return quadratic_retry();
+  if (aided.samples.empty()) return last_retries();
+  unaided_tone_power = tone_power;
   for (int symbol = 0; symbol < kChannelSymbols; ++symbol) {
     if (!optional_allowed()) return std::nullopt;
     std::copy_n(aided.samples.begin() + symbol * Mode::downsample_sps,
@@ -1313,13 +1330,13 @@ auto ChannelDecoder<Mode>::attempt_decode(
   }
   hard_errors = decoder::belief_propagation(pass_two_llrs(received_limit), payload, codeword,
                                            60, true, nullptr, control);
-  if (!accepts_codeword(2, aided.sync_power) || !optional_allowed()) return quadratic_retry();
+  if (!accepts_codeword(2, aided.sync_power) || !optional_allowed()) return last_retries();
   constexpr float channel_resolution = 12000.0f / Mode::ds_fft_span;
   float const aided_hz = std::round(acquisition_frequency / channel_resolution) * channel_resolution +
       best_delta + static_cast<float>(aided.frequency_hz);
   float const aided_dt = refined_offset + static_cast<float>(aided.timing_samples / down_rate);
   auto frame = make_frame();
-  if (!suitable_last_try(frame, aided_hz, aided_dt)) return quadratic_retry();
+  if (!suitable_last_try(frame, aided_hz, aided_dt)) return last_retries();
   frequency = aided_hz;
   offset = aided_dt;
   return finalize(std::move(frame), aided.sync_power, false);

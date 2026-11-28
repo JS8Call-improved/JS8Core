@@ -22,12 +22,22 @@ constexpr int sps = 1920;  // Normal: 6.25 Hz tone spacing
 constexpr double start_seconds = 0.5;
 constexpr double base_hz = 1500.0;
 constexpr double tau = 6.28318530717958647692;
-// Seed 1 was picked from seeds 1 to 20: at amplitudes 700, 1000 and 1500
-// (noise sigma 1000) the spread reading decodes its faded frame and the
-// decoder with spread_reading off does not.
-constexpr unsigned faded_seed = 1;
+// Seed 2 is the lowest of seeds 1 to 20 for which, at amplitudes 700, 1000
+// and 1500 (noise sigma 1000), the spread reading decodes its faded frame and
+// the decoder with spread_reading off does not (9 of the 20 seeds do).
+constexpr unsigned faded_seed = 2;
 constexpr double faded_amplitude = 1000.0;
 static_assert(DecodeParams{}.spread_reading && EngineConfig{}.spread_reading);
+
+// std::mt19937's output is fixed by the C++ standard; the standard
+// distributions are not, so draws are made here from its raw 32-bit words.
+double uniform(std::mt19937& rng) {  // in (0, 1)
+  return (static_cast<double>(rng()) + 0.5) / 4294967296.0;
+}
+double gaussian(std::mt19937& rng, double sigma) {  // Box-Muller, one value per pair
+  double const radius = std::sqrt(-2.0 * std::log(uniform(rng)));
+  return sigma * radius * std::cos(tau * uniform(rng));
+}
 
 // A Normal-speed frame through a fast-fading channel: a complex gain made of
 // paths with Gaussian Doppler offsets (two-sided spread = 2 sigma), as in the
@@ -37,14 +47,13 @@ DecodeState fixture(unsigned seed, double amplitude, double spread_hz, bool sign
   legacy_encode(4, protocol::costas(protocol::CostasType::Original), frame, tones.data());
 
   std::mt19937 rng(seed);
-  std::normal_distribution<double> doppler(0.0, spread_hz > 0.0 ? spread_hz / 2.0 : 1.0);
-  std::uniform_real_distribution<double> phase(0.0, tau);
+  double const doppler_sigma = spread_hz > 0.0 ? spread_hz / 2.0 : 1.0;
   constexpr int paths = 32;
   std::array<double, paths> path_hz{};
   std::array<double, paths> path_phase{};
   for (int k = 0; k < paths; ++k) {
-    path_hz[static_cast<std::size_t>(k)] = doppler(rng);
-    path_phase[static_cast<std::size_t>(k)] = phase(rng);
+    path_hz[static_cast<std::size_t>(k)] = gaussian(rng, doppler_sigma);
+    path_phase[static_cast<std::size_t>(k)] = tau * uniform(rng);
   }
 
   int const total = 15 * rate;
@@ -71,13 +80,12 @@ DecodeState fixture(unsigned seed, double amplitude, double spread_hz, bool sign
       }
     }
   }
-  std::normal_distribution<double> noise(0.0, 1000.0);
   std::mt19937 noise_rng(seed ^ 0x5eedu);
 
   DecodeState state;
   state.samples.assign(static_cast<std::size_t>(protocol::kJs8NtMax * rate), 0);
   for (int i = 0; i < total; ++i) {
-    double const value = std::clamp(audio[static_cast<std::size_t>(i)] + noise(noise_rng),
+    double const value = std::clamp(audio[static_cast<std::size_t>(i)] + gaussian(noise_rng, 1000.0),
                                     -32768.0, 32767.0);
     state.samples[static_cast<std::size_t>(i)] = static_cast<std::int16_t>(std::lround(value));
   }
